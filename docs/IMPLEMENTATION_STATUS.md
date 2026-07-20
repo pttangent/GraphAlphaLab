@@ -13,11 +13,19 @@ Implemented:
 - governance findings for successful-but-empty graphs and missing core files
 - per-partition shards, dashboard, progress JSON and monthly report outputs
 - Windows/Linux CI across Python 3.11 and 3.13
+- governed sector/industry reference mappings with source, confidence and effective-date support
+- theme semantic coverage, total purity, mapped purity, entropy and HHI
+- strict same-sector LOO, cross-sector LOO and semantic-disagreement signals
 
-Local validation before push:
+Validation:
 
-- `python -m py_compile ...`: pass
-- `python -m pytest -q`: 4 passed
+- baseline suite before semantic extension: 4 tests passed
+- focused semantic suite: 3 tests passed
+- semantic tests cover purity inflation from unmapped members, PIT effective-date selection and strict LOO exclusion
 - CLI `--help`: pass
 
-Known boundary: this commit provides the monthly research engine and reporting contract. It does not claim that a full production month has already been executed on the user's local warehouse.
+Known boundaries:
+
+- this branch does not claim a completed full production-month run on the user's local warehouse
+- the uploaded 1,264-symbol mapping remains user reference data and is not committed as production truth
+- semantic labels are explanatory until monthly and out-of-sample incremental IC proves otherwise
