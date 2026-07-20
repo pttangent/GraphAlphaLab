@@ -46,9 +46,22 @@ python scripts/run_monthly_alpha_research.py `
 
 Use `--only-layer return_lead_lag,price_impact_liquidity` for targeted research. Interrupting and rerunning with `--resume` reuses only shards whose input/config fingerprint still matches.
 
+## Governed theme semantics
+
+Sector and industry mappings are optional reference data. They enrich P1 communities but never redefine them. The semantic module measures mapping coverage, total-theme purity, mapped purity, entropy, HHI, source confidence, and builds strict same-sector and cross-sector leave-one-out signals.
+
+```powershell
+python scripts/run_theme_semantic_research.py `
+  --p1-root "D:\GraphFactorFactory_v2\warehouse\p1" `
+  --sector-mapping "D:\reference\sector_mapping.parquet" `
+  --output "D:\GraphAlphaLab\artifacts\theme_semantics.parquet"
+```
+
+See `docs/THEME_SEMANTICS.md` for the mapping contract and correct use in Alpha research.
+
 ## Outputs
 
-Each run creates:
+Each monthly run creates:
 
 - `partition_inventory.csv`
 - `governance_findings.csv`
