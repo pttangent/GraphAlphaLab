@@ -54,7 +54,8 @@ Controls:
 - graph signals are written as partitioned Parquet shards;
 - correlation uses deterministic sampling rather than a full 100M-row pivot;
 - all report writes are atomic;
-- `_SUCCESS` is published last.
+- `_SUCCESS` is published last;
+- compact batch merge refuses any upstream bundle without `_SUCCESS`.
 
 Do not use the legacy pattern of loading all41 signal and label rows into one Pandas DataFrame.
 
