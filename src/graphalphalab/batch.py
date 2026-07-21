@@ -25,21 +25,30 @@ class BatchSpec:
 
 BATCH_REGISTRY: dict[str, BatchSpec] = {
     "implemented27": BatchSpec(
-        "implemented27", 27, 27, ("alpha", "performance", "robustness"),
+        "implemented27", 27, 27, ("alpha", "performance", "robustness", "p1_structure", "temporal"),
         description="The original 27 executable Interaction layer-scale contracts.",
     ),
     "remaining14": BatchSpec(
-        "remaining14", 14, 14, ("alpha", "performance", "robustness"),
+        "remaining14", 14, 14, ("alpha", "performance", "robustness", "p1_structure", "temporal"),
         description="The 14 specialized Interaction layer-scale contracts.",
+    ),
+    "similarity10": BatchSpec(
+        "similarity10", 11, 10, ("p1_structure", "theme_purity", "temporal", "consensus"),
+        description="Ten layer-local Similarity P1 contracts plus the recursive consensus P1.",
     ),
     "theme_discovery": BatchSpec(
         "theme_discovery", 1, 10, ("theme_purity", "structure", "optional_alpha"),
-        description="The graph-only ten-layer Similarity consensus output.",
+        description="Legacy alias for a single consensus membership export. Prefer similarity10 P1 reporting.",
     ),
     "all41": BatchSpec(
         "all41", 41, 41, ("alpha", "performance", "robustness", "cross_batch"),
         parents=("implemented27", "remaining14"),
         description="Combined Interaction registry; built from compact batch reports.",
+    ),
+    "three_batch_33day": BatchSpec(
+        "three_batch_33day", None, 51, ("campaign", "alpha", "p1_structure", "theme_purity", "temporal"),
+        parents=("implemented27", "remaining14", "similarity10"),
+        description="Governed compact campaign report for IG27, RM14 and Similarity10 over 33 sessions.",
     ),
 }
 
