@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "graph-alpha-lab"
-version = "0.2.0"
-description = "Governed, OOM-bounded graph-signal, label, purity and Alpha reporting layer for GraphFactorFactory outputs"
+version = "0.3.0"
+description = "Governed, OOM-bounded graph-signal, P1 structure/temporal/purity and Alpha campaign reporting layer for GraphFactorFactory outputs"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
