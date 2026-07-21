@@ -5,37 +5,46 @@ GraphAlphaLab is the governed research and interpretation layer above GraphFacto
 ```text
 GFF P0 edges + node projections + P1 themes
                     ↓
-GAL graph-signal export, labels, PIT audit, purity, Alpha, costs and compact reports
+GAL graph-signal export, labels, PIT audit, P1 structure/temporal/purity,
+Alpha, costs and compact campaign reports
 ```
 
 GFF remains graph-only. GAL owns future labels, metadata interpretation and performance research.
 
-## What changed in 0.2
+## What changed in 0.3
 
-- `node_projection.node_score` is explicitly a **node baseline**, never network Alpha.
-- `gal export-gff-signals` builds OOM-bounded `graph_forward` and `graph_reverse_placebo` scores from real GFF edges.
-- `alpha-report` requires an explicit Label Contract and audits signal availability, entry/exit timing, duplicate labels and horizon consistency.
-- Statistical significance uses **daily IC means**, not hundreds of overlapping intraday snapshots as independent observations.
-- Stable negative IC is handled correctly through a predeclared direction contract.
-- Transaction costs use per-decision traded notional rather than one average turnover value applied to every observation.
-- Overlapping labels invalidate annualized Sharpe; GAL reports diagnostic daily statistics instead of inventing an annualization.
-- All41 evaluation is factor-sequential through DuckDB with an explicit memory limit, thread budget and spill directory.
-- Output files are atomic and `_SUCCESS` is written only after the governed bundle completes.
+- `gal p1-report` now scans governed GFF P1 partitions one partition at a time.
+- P1 reports include layer-local and consensus Memberships, Theme Tree refinement, relations, within-day Temporal edges, range Temporal links and Metadata Purity.
+- The canonical Similarity contract is now `similarity10`: ten layer-local P1 contracts plus `similarity_consensus@0m`.
+- `gal campaign-report` combines IG27, RM14 and Similarity10 compact reports for the 33 XNYS sessions from 2026-06-01 through 2026-07-17.
+- Large P1 Parquet trees are never concatenated into one all-history Pandas frame; each governed partition is validated, summarized and released before the next partition.
+- Campaign merge reads only compact report bundles and refuses missing `_SUCCESS`, partial reports or incomplete date coverage.
+
+The 0.2 graph-alpha controls remain unchanged:
+
+- `node_projection.node_score` is a node baseline, never network Alpha.
+- `gal export-gff-signals` builds `graph_forward` and `graph_reverse_placebo` from real GFF edges.
+- `alpha-report` requires an explicit Label Contract and uses daily IC as the inference unit.
+- Overlapping labels invalidate annualized Sharpe.
+- DuckDB memory, threads and spill are bounded.
+- `_SUCCESS` is always published last.
 
 ## Install
 
 ```bash
 python -m pip install -e ".[test]"
+python -m compileall -q src scripts
+python -m pytest -q --tb=short
 ```
 
-## 1. Export actual graph signals from GFF
+## Export Interaction graph signals
 
 ```powershell
 $HEAD = (git rev-parse HEAD).Trim()
 
 gal export-gff-signals `
   --batch-id implemented27 `
-  --p0-root "D:\GFF\interaction\p0" `
+  --p0-root "D:\GFF\ig27\p0" `
   --variants "node_baseline,graph_forward,graph_reverse_placebo" `
   --output "D:\GAL\signals\implemented27" `
   --memory-limit-gb 24 `
@@ -45,32 +54,34 @@ gal export-gff-signals `
   --require-clean
 ```
 
-The exporter rejects any edge with `edge_available_time > decision_time` and records the SHA-256 of every P0 input and exported shard.
+Repeat with `--batch-id remaining14` and its own P0 root.
 
-## 2. Create an explicit label contract
+## Evaluate a 33-session P1 batch
 
-Example `forward_5m.json`:
-
-```json
-{
-  "label_id": "forward_5m_next_bar",
-  "horizon_minutes": 5,
-  "entry_lag_minutes": 1,
-  "target_column": "target_return",
-  "decision_time_column": "decision_time",
-  "entry_time_column": "entry_time",
-  "exit_time_column": "exit_time",
-  "available_time_column": "label_available_time",
-  "overlapping": true,
-  "rebalance_minutes": 5,
-  "horizon_tolerance_seconds": 60,
-  "require_entry_after_decision": true
-}
+```powershell
+gal p1-report `
+  --batch-id similarity10 `
+  --p1-root "D:\GFF\similarity\p1" `
+  --range-root "D:\GFF\similarity\range" `
+  --metadata "D:\NFF\reference\symbol_metadata.parquet" `
+  --dimensions "sector_code,industry_code,country,market_cap_bucket,semantic_theme" `
+  --start-date 2026-06-01 `
+  --end-date 2026-07-17 `
+  --expected-date-count 33 `
+  --require-consensus `
+  --memory-limit-gb 24 `
+  --threads 8 `
+  --temp-directory "D:\GAL\duckdb_tmp" `
+  --output "D:\GAL\reports\similarity10_p1" `
+  --expected-git-commit $HEAD `
+  --require-clean
 ```
 
-Labels must contain the contract columns and one row per declared join key. GAL refuses same-time entry, duplicate targets, incorrect horizons and labels available before the exit price exists.
+For `implemented27` and `remaining14`, point `--p1-root` to the corresponding isolated P1 root. The expected contract counts are taken from the batch registry: 27, 14 and 11 respectively.
 
-## 3. Run an OOM-bounded batch report
+## Run Alpha reports
+
+Use one governed report per horizon. Example:
 
 ```powershell
 gal alpha-report `
@@ -87,33 +98,44 @@ gal alpha-report `
   --threads 8 `
   --temp-directory "D:\GAL\duckdb_tmp" `
   --min-cross-section 100 `
-  --output "D:\GAL\reports\implemented27" `
+  --output "D:\GAL\reports\implemented27_5m" `
   --expected-git-commit $HEAD `
   --require-clean
 ```
 
-`default-direction=auto` is allowed for exploration, but such factors are never governance-ready candidates. Production-grade research should provide a predeclared `expected_direction` column.
+Repeat for 15m and 30m, then for `remaining14`.
 
-## 4. Theme Discovery purity
-
-```powershell
-gal theme-report `
-  --batch-id theme_discovery `
-  --memberships "D:\GFF\similarity\memberships.parquet" `
-  --metadata "D:\NFF\reference\symbol_metadata.parquet" `
-  --output "D:\GAL\reports\theme_discovery"
-```
-
-Metadata evaluates the GFF memberships but never changes them.
-
-## 5. Compact all41 merge
+## Compact all41 Alpha merge
 
 ```powershell
 gal merge-reports `
-  --inputs "D:\GAL\reports\implemented27" "D:\GAL\reports\remaining14" `
-  --output "D:\GAL\reports\all41"
+  --inputs "D:\GAL\reports\implemented27_5m" "D:\GAL\reports\remaining14_5m" `
+  --output "D:\GAL\reports\all41_5m"
 ```
 
-The merge requires upstream `_SUCCESS` files and hashed summaries; it never rereads large GFF partitions.
+## Three-batch 33-day campaign
 
-See `docs/GOVERNANCE_AND_RESOURCE_CONTRACT.md`, `docs/REPORT_SPEC.md` and `docs/BATCH_CONTRACT.md`.
+```powershell
+gal campaign-report `
+  --implemented27-alpha `
+    "D:\GAL\reports\implemented27_5m" `
+    "D:\GAL\reports\implemented27_15m" `
+    "D:\GAL\reports\implemented27_30m" `
+  --implemented27-p1 "D:\GAL\reports\implemented27_p1" `
+  --remaining14-alpha `
+    "D:\GAL\reports\remaining14_5m" `
+    "D:\GAL\reports\remaining14_15m" `
+    "D:\GAL\reports\remaining14_30m" `
+  --remaining14-p1 "D:\GAL\reports\remaining14_p1" `
+  --similarity-p1 "D:\GAL\reports\similarity10_p1" `
+  --all41-alpha `
+    "D:\GAL\reports\all41_5m" `
+    "D:\GAL\reports\all41_15m" `
+    "D:\GAL\reports\all41_30m" `
+  --start-date 2026-06-01 `
+  --end-date 2026-07-17 `
+  --expected-date-count 33 `
+  --output "D:\GAL\reports\three_batch_33day"
+```
+
+See `docs/THREE_BATCH_33DAY_RUNBOOK.md` for the complete governed workflow and output contract.
