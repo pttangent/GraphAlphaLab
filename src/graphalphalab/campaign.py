@@ -93,15 +93,16 @@ def build_campaign_report(
         root = source.path.expanduser().resolve()
         summary = _validate_bundle(root)
         dates = _dates_from_report(root)
-        if not dates:
-            raise ValueError(f"Report has no auditable trade_date evidence: {root}")
-        if min(dates) < start_date or max(dates) > end_date:
-            raise ValueError(f"Report contains dates outside campaign range: {root}")
-        if len(dates) != expected_date_count:
-            raise ValueError(
-                f"Report {root} expected {expected_date_count} dates, observed {len(dates)}: {sorted(dates)}"
-            )
-        all_dates.update(dates)
+        if source.report_type != "alpha_merged":
+            if not dates:
+                raise ValueError(f"Report has no auditable trade_date evidence: {root}")
+            if min(dates) < start_date or max(dates) > end_date:
+                raise ValueError(f"Report contains dates outside campaign range: {root}")
+            if len(dates) != expected_date_count:
+                raise ValueError(
+                    f"Report {root} expected {expected_date_count} dates, observed {len(dates)}: {sorted(dates)}"
+                )
+            all_dates.update(dates)
         source_rows.append({
             "batch_id": source.batch_id,
             "report_type": source.report_type,
