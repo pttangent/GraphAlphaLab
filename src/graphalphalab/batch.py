@@ -7,7 +7,7 @@ from typing import Iterable
 
 import pandas as pd
 
-from .io import atomic_write_json, atomic_write_text
+from .governance import atomic_write_frame, atomic_write_json, atomic_write_text, sha256_file
 
 
 @dataclass(frozen=True)
@@ -33,8 +33,8 @@ BATCH_REGISTRY: dict[str, BatchSpec] = {
         description="The 14 specialized Interaction layer-scale contracts.",
     ),
     "theme_discovery": BatchSpec(
-        "theme_discovery", 1, 12, ("theme_purity", "structure", "optional_alpha"),
-        description="Ten core and two diagnostic similarity inputs feeding the Theme Base Graph.",
+        "theme_discovery", 1, 10, ("theme_purity", "structure", "optional_alpha"),
+        description="The graph-only ten-layer Similarity consensus output.",
     ),
     "all41": BatchSpec(
         "all41", 41, 41, ("alpha", "performance", "robustness", "cross_batch"),
@@ -51,12 +51,7 @@ def get_batch(batch_id: str) -> BatchSpec:
     return BATCH_REGISTRY[key]
 
 
-def validate_batch_contracts(
-    frame: pd.DataFrame,
-    batch_id: str,
-    *,
-    allow_partial: bool = False,
-) -> dict[str, object]:
+def validate_batch_contracts(frame: pd.DataFrame, batch_id: str, *, allow_partial: bool = False) -> dict[str, object]:
     spec = get_batch(batch_id)
     keys = [column for column in ("layer_id", "scale_minutes") if column in frame.columns]
     actual = int(frame[keys].drop_duplicates().shape[0]) if keys else None
@@ -77,51 +72,60 @@ def validate_batch_contracts(
 
 
 def merge_compact_reports(inputs: Iterable[str | Path], output_root: str | Path) -> Path:
+    roots = [Path(raw).expanduser().resolve() for raw in inputs]
     output_root = Path(output_root).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     summaries: list[dict[str, object]] = []
     metrics: list[pd.DataFrame] = []
-    for raw in inputs:
-        root = Path(raw).expanduser().resolve()
+    source_hashes: list[dict[str, object]] = []
+    for root in roots:
         summary_path = root / "summary.json"
+        success_path = root / "_SUCCESS"
         metrics_path = root / "alpha_metrics.csv"
-        if not summary_path.exists():
-            raise FileNotFoundError(summary_path)
-        summaries.append(json.loads(summary_path.read_text(encoding="utf-8")))
+        if not summary_path.exists() or not success_path.exists():
+            raise FileNotFoundError(f"Compact report is not governed/complete: {root}")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if bool(summary.get("batch_status", {}).get("partial")):
+            raise ValueError(f"Cannot merge partial report without an explicit upstream completion: {root}")
+        summaries.append(summary)
+        source_hashes.append({"root": str(root), "summary_sha256": sha256_file(summary_path), "success_sha256": sha256_file(success_path)})
         if metrics_path.exists():
             frame = pd.read_csv(metrics_path)
             frame["source_report"] = str(root)
             metrics.append(frame)
     combined = pd.concat(metrics, ignore_index=True) if metrics else pd.DataFrame()
     if not combined.empty:
-        combined.to_csv(output_root / "alpha_metrics.csv", index=False)
-        ranking_columns = [
-            column
-            for column in ("fdr_pass", "net_sharpe_5bps", "mean_spearman_ic")
-            if column in combined.columns
-        ]
-        ranking = (
-            combined.sort_values(ranking_columns, ascending=[False] * len(ranking_columns))
-            if ranking_columns
-            else combined.copy()
-        )
-        ranking.to_csv(output_root / "ranking.csv", index=False)
+        atomic_write_frame(combined, output_root / "alpha_metrics.csv")
+        ranking_columns = [column for column in ("research_status", "fdr_pass", "net_mean_5bps", "mean_spearman_ic") if column in combined.columns]
+        ranking = combined.copy()
+        if "research_status" in ranking:
+            ranking["_status_rank"] = ranking["research_status"].map({"candidate": 0, "needs_falsification": 1, "insufficient_or_rejected": 2}).fillna(3)
+            ranking_columns = ["_status_rank", *[c for c in ranking_columns if c != "research_status"]]
+        if ranking_columns:
+            ranking = ranking.sort_values(ranking_columns, ascending=[True] + [False] * (len(ranking_columns) - 1), na_position="last")
+        atomic_write_frame(ranking.drop(columns=["_status_rank"], errors="ignore"), output_root / "ranking.csv")
     payload = {
         "batch_id": "all41",
-        "source_reports": [str(Path(value).resolve()) for value in inputs],
+        "source_reports": [str(root) for root in roots],
         "source_summaries": summaries,
+        "source_hashes": source_hashes,
         "factor_count": int(len(combined)),
-        "complete": all(not bool(item.get("batch_status", {}).get("partial")) for item in summaries),
+        "complete": True,
     }
     atomic_write_json(output_root / "summary.json", payload)
-    lines = [
-        "# GraphAlphaLab all41 compact merge",
-        "",
-        f"- Source reports: {len(summaries)}",
-        f"- Factor rows: {len(combined)}",
-        f"- Complete: {payload['complete']}",
-        "",
-        "This report was merged from compact batch summaries and did not reread large GFF partitions.",
-    ]
-    atomic_write_text(output_root / "REPORT.md", "\n".join(lines) + "\n")
+    atomic_write_text(
+        output_root / "REPORT.md",
+        "\n".join(
+            [
+                "# GraphAlphaLab all41 compact merge",
+                "",
+                f"- Source reports: {len(summaries)}",
+                f"- Factor rows: {len(combined)}",
+                "- Complete: True",
+                "",
+                "This report was merged from hashed compact report bundles and did not reread large GFF partitions.",
+            ]
+        ) + "\n",
+    )
+    atomic_write_json(output_root / "_SUCCESS", {"source_count": len(roots), "factor_count": len(combined)})
     return output_root

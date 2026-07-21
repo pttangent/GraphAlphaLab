@@ -1,50 +1,22 @@
 # Batch reporting contract
 
-## Built-in batches
-
-| Batch | Expected layer-scale contracts | Primary output |
+| Batch | Expected graph contracts | Primary output |
 |---|---:|---|
-| `implemented27` | 27 | Alpha and performance report |
-| `remaining14` | 14 | Alpha and performance report |
-| `theme_discovery` | 1 consensus output / 12 upstream inputs | Theme purity and structure report; optional Alpha |
-| `all41` | 41 | Compact merge of implemented27 + remaining14 |
+| `implemented27` | 27 layer-scale contracts | Node baselines, graph variants, Alpha and robustness |
+| `remaining14` | 14 layer-scale contracts | Node baselines, graph variants, Alpha and robustness |
+| `theme_discovery` | 1 consensus membership output; 10 core Similarity inputs | Purity and structure; optional Alpha |
+| `all41` | 41 layer-scale contracts | Hashed compact merge of 27 + 14 |
 
-A report with fewer observed contracts is rejected unless `--allow-partial` is explicit. Partial status is written into `summary.json` and the report header.
+A layer-scale contract may contain multiple variants. The contract count is therefore based on unique `layer_id × scale_minutes`, not factor-row count.
 
-## Report bundle
-
-Each batch output is self-contained and compact:
+The minimum governed Interaction variants are:
 
 ```text
-<output>/
-├── REPORT.md
-├── summary.json
-├── alpha_metrics.csv                 # when Alpha is evaluated
-├── ranking.csv
-├── ic_series.csv
-├── quantile_returns.csv
-├── portfolio_returns.csv
-├── stability_slices.csv
-├── score_correlation.csv
-├── theme_purity.csv                  # for Theme Discovery
-├── purity_dimension_summary.csv
-├── purity_snapshot_agreement.csv
-├── metadata_profile.json
-├── highest_purity_themes.csv
-└── lowest_purity_themes.csv
+node_baseline
+graph_forward
+graph_reverse_placebo
 ```
 
-The bundle must record input SHA-256 values and batch completion. A later `all41` merge reads only these compact files.
+`node_baseline` must never be described as network Alpha.
 
-## Required input identity
-
-Every production research bundle should record:
-
-- GAL Git commit;
-- GFF Git commit and run manifest hash;
-- GFF P0/P1 partition hashes;
-- NFF signal and target manifest hashes;
-- label contract and horizon;
-- metadata file hash and selected dimensions;
-- batch ID, expected and observed contracts;
-- partial/completed status.
+Reports with fewer contracts are rejected unless `--allow-partial` is explicit. Compact merges reject partial or missing `_SUCCESS` bundles.
