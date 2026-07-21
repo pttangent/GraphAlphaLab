@@ -3,9 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import gc
 import json
+import os
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Iterable, Any
 
+import duckdb
 import numpy as np
 import pandas as pd
 import psutil
@@ -14,6 +18,7 @@ import pyarrow.parquet as pq
 
 from .governance import (
     ResourceBudget,
+    configure_duckdb,
     atomic_write_frame,
     atomic_write_json,
     atomic_write_text,
@@ -36,6 +41,9 @@ class P1ReportResult:
     range_temporal_summary: pd.DataFrame
     purity: PurityResult | None
     governance: dict[str, object]
+    purity_detail_shards: tuple[Path, ...] = ()
+    purity_agreement_shards: tuple[Path, ...] = ()
+    spool_root: Path | None = None
 
 
 def _schema_hash(schema: pa.Schema) -> str:
@@ -131,6 +139,79 @@ def _aggregate_purity(detail: pd.DataFrame, agreement: pd.DataFrame, profile: di
             })
         summary = pd.DataFrame(rows)
     return PurityResult(detail, summary, agreement, profile)
+
+
+def _duckdb_path_list(paths: Iterable[Path]) -> list[str]:
+    return [str(path.expanduser().resolve()) for path in paths]
+
+
+def _summarize_purity_shards(
+    detail_paths: list[Path],
+    agreement_paths: list[Path],
+    *,
+    profile: dict[str, object],
+    budget: ResourceBudget,
+) -> PurityResult:
+    if not detail_paths:
+        return PurityResult(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), profile)
+    connection = duckdb.connect()
+    try:
+        configure_duckdb(connection, budget)
+        connection.read_parquet(_duckdb_path_list(detail_paths), union_by_name=True).create_view("purity_detail")
+        summary = connection.execute(
+            """
+            SELECT
+              dimension,
+              count(*)::BIGINT AS theme_count,
+              avg(coverage) AS mean_coverage,
+              CASE WHEN sum(CASE WHEN isfinite(purity_weighted) THEN covered_member_count ELSE 0 END) > 0
+                   THEN sum(CASE WHEN isfinite(purity_weighted) THEN purity_weighted * covered_member_count ELSE 0 END)
+                        / sum(CASE WHEN isfinite(purity_weighted) THEN covered_member_count ELSE 0 END)
+                   ELSE NULL END AS weighted_purity,
+              median(purity_weighted) AS median_purity,
+              quantile_cont(purity_weighted, 0.10) AS p10_purity,
+              quantile_cont(purity_weighted, 0.90) AS p90_purity,
+              avg(normalized_entropy) AS mean_normalized_entropy,
+              avg(CASE WHEN isfinite(dominant_lift) THEN dominant_lift ELSE NULL END) AS mean_dominant_lift
+            FROM purity_detail
+            GROUP BY dimension
+            ORDER BY dimension
+            """
+        ).df()
+        if agreement_paths:
+            connection.read_parquet(_duckdb_path_list(agreement_paths), union_by_name=True).create_view("purity_agreement")
+            agreement = connection.execute(
+                """
+                SELECT
+                  dimension, layer_id, scale_minutes,
+                  count(*)::BIGINT AS snapshot_count,
+                  avg(nmi) AS mean_nmi,
+                  median(nmi) AS median_nmi,
+                  avg(ari) AS mean_ari,
+                  median(ari) AS median_ari,
+                  avg(covered_members) AS mean_covered_members
+                FROM purity_agreement
+                GROUP BY dimension, layer_id, scale_minutes
+                ORDER BY dimension, layer_id, scale_minutes
+                """
+            ).df()
+        else:
+            agreement = pd.DataFrame()
+    finally:
+        connection.close()
+    return PurityResult(pd.DataFrame(), summary, agreement, profile)
+
+
+def _copy_shards(paths: Iterable[Path], target: Path) -> list[dict[str, object]]:
+    target.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, object]] = []
+    for index, source in enumerate(paths):
+        destination = target / f"part-{index:06d}.parquet"
+        temporary = destination.with_suffix(".parquet.part")
+        shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+        records.append(file_record(destination))
+    return records
 
 
 def _snapshot_structure(memberships: pd.DataFrame) -> pd.DataFrame:
@@ -238,8 +319,16 @@ def evaluate_p1_streaming(
     structure_frames: list[pd.DataFrame] = []
     temporal_frames: list[pd.DataFrame] = []
     relation_frames: list[pd.DataFrame] = []
-    purity_detail: list[pd.DataFrame] = []
-    purity_agreement: list[pd.DataFrame] = []
+    purity_detail_paths: list[Path] = []
+    purity_agreement_paths: list[Path] = []
+    spool_root: Path | None = None
+    if metadata_profile is not None:
+        temp_parent = Path(budget.temp_directory).expanduser().resolve() if budget.temp_directory else None
+        if temp_parent is not None:
+            temp_parent.mkdir(parents=True, exist_ok=True)
+        spool_root = Path(tempfile.mkdtemp(prefix="gal-p1-purity-", dir=str(temp_parent) if temp_parent else None))
+        (spool_root / "detail").mkdir(parents=True, exist_ok=True)
+        (spool_root / "agreement").mkdir(parents=True, exist_ok=True)
     observed_dates: set[str] = set()
     observed_contracts: set[tuple[str, int]] = set()
     consensus_seen = False
@@ -266,7 +355,24 @@ def evaluate_p1_streaming(
         tree = _tree_snapshot_summary(partition / "theme_tree_nodes.parquet")
         if not tree.empty:
             merge_keys = [column for column in ("trade_date", "decision_time", "layer_id", "scale_minutes") if column in snapshot and column in tree]
-            snapshot = snapshot.merge(tree, on=merge_keys, how="left")
+            if snapshot.empty:
+                snapshot = tree.copy()
+                for column, default in {
+                    "membership_rows": 0,
+                    "canonical_membership_rows": 0,
+                    "noncanonical_membership_rows": 0,
+                    "unique_symbols": 0,
+                    "theme_count": 0,
+                    "mean_theme_size": np.nan,
+                    "median_theme_size": np.nan,
+                    "p90_theme_size": np.nan,
+                    "max_theme_size": 0,
+                    "forced_chunk_memberships": 0,
+                    "max_tree_depth": 0,
+                }.items():
+                    snapshot[column] = default
+            elif merge_keys:
+                snapshot = snapshot.merge(tree, on=merge_keys, how="left")
         structure_frames.append(snapshot)
 
         temporal = _read_columns(partition / "temporal_edges.parquet", [
@@ -302,8 +408,16 @@ def evaluate_p1_streaming(
                     membership_id=membership_id,
                     metadata_id=metadata_profile["id_column"],
                 )
-                purity_detail.append(purity.theme_dimension)
-                purity_agreement.append(purity.snapshot_agreement)
+                if spool_root is None:
+                    raise AssertionError("Purity spool was not initialized")
+                if not purity.theme_dimension.empty:
+                    detail_path = spool_root / "detail" / f"part-{len(purity_detail_paths):06d}.parquet"
+                    purity.theme_dimension.to_parquet(detail_path, index=False)
+                    purity_detail_paths.append(detail_path)
+                if not purity.snapshot_agreement.empty:
+                    agreement_path = spool_root / "agreement" / f"part-{len(purity_agreement_paths):06d}.parquet"
+                    purity.snapshot_agreement.to_parquet(agreement_path, index=False)
+                    purity_agreement_paths.append(agreement_path)
 
         qa_path = partition / "qa.json"
         qa = json.loads(qa_path.read_text(encoding="utf-8")) if qa_path.exists() else {}
@@ -357,9 +471,16 @@ def evaluate_p1_streaming(
                 range_frames.append(summary)
     range_temporal = pd.concat(range_frames, ignore_index=True) if range_frames else pd.DataFrame()
 
-    detail = pd.concat(purity_detail, ignore_index=True) if purity_detail else pd.DataFrame()
-    agreement = pd.concat(purity_agreement, ignore_index=True) if purity_agreement else pd.DataFrame()
-    purity_result = _aggregate_purity(detail, agreement, metadata_profile or {}) if metadata_profile is not None else None
+    purity_result = (
+        _summarize_purity_shards(
+            purity_detail_paths,
+            purity_agreement_paths,
+            profile=metadata_profile or {},
+            budget=budget,
+        )
+        if metadata_profile is not None
+        else None
+    )
 
     complete = True
     errors: list[str] = []
@@ -376,6 +497,8 @@ def evaluate_p1_streaming(
         complete = False
         errors.append("one or more P1 partitions reported PIT violations")
     if not complete and not allow_partial:
+        if spool_root is not None and spool_root.exists():
+            shutil.rmtree(spool_root, ignore_errors=True)
         raise ValueError("P1 report contract failed: " + "; ".join(errors))
 
     governance = {
@@ -394,6 +517,8 @@ def evaluate_p1_streaming(
         "errors": errors,
         "partition_count": len(partition_summary),
         "peak_rss_bytes": peak_rss,
+        "purity_detail_shard_count": len(purity_detail_paths),
+        "purity_agreement_shard_count": len(purity_agreement_paths),
         "resource_budget": budget.as_dict(),
     }
     return P1ReportResult(
@@ -405,6 +530,9 @@ def evaluate_p1_streaming(
         range_temporal,
         purity_result,
         governance,
+        tuple(purity_detail_paths),
+        tuple(purity_agreement_paths),
+        spool_root,
     )
 
 
@@ -428,9 +556,18 @@ def write_p1_report_bundle(
     atomic_write_frame(result.relation_summary, output / "p1_relation_summary.csv")
     atomic_write_frame(result.range_temporal_summary, output / "p1_range_temporal_summary.csv")
     if result.purity is not None:
-        atomic_write_frame(result.purity.theme_dimension, output / "theme_purity.csv")
+        detail_target = output / "theme_purity_parts"
+        agreement_target = output / "purity_snapshot_agreement_parts"
+        if detail_target.exists():
+            shutil.rmtree(detail_target)
+        if agreement_target.exists():
+            shutil.rmtree(agreement_target)
+        detail_records = _copy_shards(result.purity_detail_shards, detail_target)
+        agreement_records = _copy_shards(result.purity_agreement_shards, agreement_target)
+        atomic_write_json(output / "theme_purity_parts_manifest.json", detail_records)
+        atomic_write_json(output / "purity_snapshot_agreement_parts_manifest.json", agreement_records)
         atomic_write_frame(result.purity.dimension_summary, output / "purity_dimension_summary.csv")
-        atomic_write_frame(result.purity.snapshot_agreement, output / "purity_snapshot_agreement.csv")
+        atomic_write_frame(result.purity.snapshot_agreement, output / "purity_snapshot_agreement_summary.csv")
         atomic_write_json(output / "metadata_profile.json", result.purity.metadata_profile)
 
     manifest = run_manifest or implementation_manifest(
@@ -485,4 +622,6 @@ def write_p1_report_bundle(
     ])
     atomic_write_text(output / "REPORT.md", "\n".join(lines))
     atomic_write_json(success, {"batch_id": batch_id, "complete": bool(result.governance["complete"])})
+    if result.spool_root is not None and result.spool_root.exists():
+        shutil.rmtree(result.spool_root, ignore_errors=True)
     return output
