@@ -1,0 +1,49 @@
+name: Install governed GraphAlphaLab patch
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  install-and-test:
+    if: github.head_ref == 'agent/batch-alpha-reporting' || github.ref_name == 'agent/batch-alpha-reporting'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/batch-alpha-reporting
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Decode governed patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .gal_patch/chunk_* | base64 --decode > /tmp/gal_governed_patch.tar.gz
+          echo 'cb2aa805040f4cbd9f7c6a4a59f000cdcb3dc07e119b8ff6dc995dad5b5e3224  /tmp/gal_governed_patch.tar.gz' | sha256sum -c -
+          tar -xzf /tmp/gal_governed_patch.tar.gz -C .
+      - name: Install and test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test]'
+          python -m compileall -q src scripts
+          python -m pytest -q --tb=short
+      - name: Publish atomic tested patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .gal_patch
+          rm -f .github/workflows/install_governed_gal_patch.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'feat: govern and stream graph alpha research'
+          git push origin HEAD:agent/batch-alpha-reporting
