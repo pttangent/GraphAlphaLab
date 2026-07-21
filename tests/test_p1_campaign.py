@@ -99,7 +99,9 @@ def test_p1_report_streams_governed_partition_and_publishes_bundle(tmp_path: Pat
         resource_budget=ResourceBudget(memory_limit_gb=1, threads=1),
     )
     assert (output / "_SUCCESS").exists()
-    assert (output / "theme_purity.csv").exists()
+    assert (output / "theme_purity_parts_manifest.json").exists()
+    assert any((output / "theme_purity_parts").glob("*.parquet"))
+    assert (output / "purity_dimension_summary.csv").exists()
 
 
 def _fake_report(root: Path, *, report_type: str, batch_id: str, trade_date: str) -> Path:
