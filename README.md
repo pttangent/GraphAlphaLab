@@ -17,7 +17,7 @@ GFF remains graph-only. GAL owns future labels, metadata interpretation and perf
 - P1 reports include layer-local and consensus Memberships, Theme Tree refinement, relations, within-day Temporal edges, range Temporal links and Metadata Purity.
 - The canonical Similarity contract is now `similarity10`: ten layer-local P1 contracts plus `similarity_consensus@0m`.
 - `gal campaign-report` combines IG27, RM14 and Similarity10 compact reports for the 33 XNYS sessions from 2026-06-01 through 2026-07-17.
-- Large P1 Parquet trees are never concatenated into one all-history Pandas frame; each governed partition is validated, summarized and released before the next partition.
+- Large P1 Parquet trees are never concatenated into one all-history Pandas frame; each governed partition is validated, summarized and released before the next partition. Purity detail is disk-sharded and aggregated with bounded DuckDB.
 - Campaign merge reads only compact report bundles and refuses missing `_SUCCESS`, partial reports or incomplete date coverage.
 
 The 0.2 graph-alpha controls remain unchanged:
@@ -78,6 +78,8 @@ gal p1-report `
 ```
 
 For `implemented27` and `remaining14`, point `--p1-root` to the corresponding isolated P1 root. The expected contract counts are taken from the batch registry: 27, 14 and 11 respectively.
+
+Detailed purity evidence is written as partitioned Parquet shards under the report bundle. Compact `purity_dimension_summary.csv` and `purity_snapshot_agreement_summary.csv` are used for comparison and campaign merging.
 
 ## Run Alpha reports
 
