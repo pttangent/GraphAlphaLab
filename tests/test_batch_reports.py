@@ -20,7 +20,10 @@ def test_compact_merge_does_not_need_raw_partitions(tmp_path) -> None:
     for batch in ("implemented27", "remaining14"):
         root = tmp_path / batch
         root.mkdir()
-        (root / "summary.json").write_text(json.dumps({"batch_id": batch, "batch_status": {"partial": False}}), encoding="utf-8")
+        (root / "summary.json").write_text(
+            json.dumps({"batch_id": batch, "batch_status": {"partial": False}}),
+            encoding="utf-8",
+        )
         pd.DataFrame({
             "batch_id": [batch],
             "factor_id": [batch],
@@ -28,6 +31,7 @@ def test_compact_merge_does_not_need_raw_partitions(tmp_path) -> None:
             "net_sharpe_5bps": [1.0],
             "fdr_pass": [True],
         }).to_csv(root / "alpha_metrics.csv", index=False)
+        (root / "_SUCCESS").write_text("complete\n", encoding="utf-8")
         roots.append(root)
     output = merge_compact_reports(roots, tmp_path / "all41")
     summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
