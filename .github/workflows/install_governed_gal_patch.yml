@@ -28,14 +28,18 @@ jobs:
           cat .gal_patch/chunk_* | base64 --decode > /tmp/gal_governed_patch.tar.gz
           echo 'cb2aa805040f4cbd9f7c6a4a59f000cdcb3dc07e119b8ff6dc995dad5b5e3224  /tmp/gal_governed_patch.tar.gz' | sha256sum -c -
           tar -xzf /tmp/gal_governed_patch.tar.gz -C .
-      - name: Install and test
+      - name: Install
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install -e '.[test]'
-          python -m compileall -q src scripts
-          python -m pytest -q --tb=short
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet -e '.[test]'
+      - name: Compile
+        shell: bash
+        run: python -m compileall -q src scripts
+      - name: Test
+        shell: bash
+        run: python -m pytest -q --tb=short
       - name: Publish atomic tested patch
         shell: bash
         run: |
