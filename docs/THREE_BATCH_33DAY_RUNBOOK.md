@@ -94,7 +94,7 @@ $TEMP = "D:\GAL\duckdb_tmp"
 New-Item -ItemType Directory -Force $TEMP | Out-Null
 ```
 
-Do not run the two Interaction signal exporters or Alpha reports simultaneously. Do not concatenate the 33-day P1 Membership Parquets with Pandas. `p1-report` validates and releases one governed partition at a time.
+Do not run the two Interaction signal exporters or Alpha reports simultaneously. Do not concatenate the 33-day P1 Membership Parquets with Pandas. `p1-report` validates and releases one governed partition at a time. High-cardinality purity detail is written as partitioned Parquet shards under the report bundle and summarized with bounded DuckDB; it is never accumulated into one multi-million-row Pandas table.
 
 ## Variables
 
@@ -323,9 +323,11 @@ The campaign command refuses:
 missing _SUCCESS
 partial child reports
 missing required IG27/RM14/Similarity10 sources
-any child report with fewer or more than 33 dates
-any date outside 2026-06-01 through 2026-07-17
+any primary child report with fewer or more than 33 dates
+any primary date outside 2026-06-01 through 2026-07-17
 ```
+
+Derived `all41` compact reports do not repeat `daily_ic.csv`; they are accepted only after their governed summary and `_SUCCESS` are validated.
 
 ## P1 report outputs
 
@@ -341,12 +343,17 @@ p1_layer_summary.csv
 p1_temporal_summary.csv
 p1_relation_summary.csv
 p1_range_temporal_summary.csv
-theme_purity.csv
+theme_purity_parts/part-*.parquet
+theme_purity_parts_manifest.json
 purity_dimension_summary.csv
-purity_snapshot_agreement.csv
+purity_snapshot_agreement_parts/part-*.parquet
+purity_snapshot_agreement_parts_manifest.json
+purity_snapshot_agreement_summary.csv
 metadata_profile.json
 _SUCCESS
 ```
+
+The detailed purity and agreement evidence remains partitioned on disk to prevent OOM. The summary CSV files are compact and suitable for campaign merging.
 
 Range Temporal may be empty for Interaction batches if GFF did not produce range links. Daily `temporal_edges.parquet` remains part of every governed P1 partition.
 
