@@ -4,16 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "graph-alpha-lab"
-version = "0.1.0"
-description = "Batch-oriented alpha, label, metadata-purity and compact reporting layer for GraphFactorFactory outputs"
+version = "0.2.0"
+description = "Governed, OOM-bounded graph-signal, label, purity and Alpha reporting layer for GraphFactorFactory outputs"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [{name = "pttangent"}]
 dependencies = [
+  "duckdb>=1.1,<2",
   "numpy>=1.26,<3",
   "pandas>=2.2,<4",
   "pyarrow>=17,<24",
+  "psutil>=6,<8",
   "scipy>=1.13,<2",
   "scikit-learn>=1.5,<2",
 ]
