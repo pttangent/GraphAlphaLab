@@ -41,6 +41,19 @@ def test_checkpoint_reuse_requires_matching_contract_source_and_file_hash(tmp_pa
     assert not checkpoint_valid(root, spec, required_files=("metrics.parquet",))
 
 
+def test_checkpoint_rejects_incorrect_recorded_parquet_row_count(tmp_path: Path) -> None:
+    root = tmp_path / "factor"
+    spec = CheckpointSpec("alpha-factor", "factor=a", "contract-a", "source-a")
+    commit_frames(root, spec, {"metrics.parquet": pd.DataFrame({"value": [1, 2, 3]})})
+
+    marker = root / "checkpoint.json"
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    payload["files"][0]["rows"] = 2
+    marker.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert not checkpoint_valid(root, spec, required_files=("metrics.parquet",))
+
+
 def test_progress_writes_machine_and_human_readable_dashboards(tmp_path: Path) -> None:
     payload = write_progress(
         tmp_path,
