@@ -97,3 +97,5 @@ Use `--reset-checkpoints` only after a deliberate contract or source reset. Norm
 ## Current boundary
 
 This branch contains governed recovery for P1 reporting, global intraday and daily Alpha, legacy theme purity, GFF signal export and the checked-in daily label builder. `run_within_theme_alpha.py` still recovers at whole-report granularity. Warehouse-only scripts that are not checked into this repository, including local EOD or intraday label builders, are not silently treated as fixed; they must adopt the same shard and checkpoint contract separately.
+
+The repository-level operational entrypoint is `scripts/gal_warehouse/README.md`; this document is the authoritative validation and recovery contract.
