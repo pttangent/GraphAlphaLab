@@ -20,4 +20,25 @@ jobs:
       - run: python -m pip install --quiet --upgrade pip
       - run: python -m pip install --quiet -e ".[test]"
       - run: python -m compileall -q src scripts
+      - name: Parse PowerShell schedulers
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $allErrors = @()
+          Get-ChildItem -Path scripts -Recurse -Filter '*.ps1' | ForEach-Object {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$tokens,
+              [ref]$parseErrors
+            ) | Out-Null
+            foreach ($parseError in $parseErrors) {
+              $allErrors += "$($_.FullName):$($parseError.Extent.StartLineNumber): $($parseError.Message)"
+            }
+          }
+          if ($allErrors.Count -gt 0) {
+            $allErrors | ForEach-Object { Write-Error $_ }
+            throw "PowerShell parser found $($allErrors.Count) error(s)."
+          }
       - run: python -m pytest -q --tb=short
