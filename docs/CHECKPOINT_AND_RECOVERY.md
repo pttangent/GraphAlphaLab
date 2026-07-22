@@ -93,3 +93,7 @@ Before manually resetting checkpoints, inspect:
 4. the failed checkpoint or child report.
 
 Use `--reset-checkpoints` only after a deliberate contract or source reset. Normal OOM, process termination and machine reboot require no cleanup.
+
+## Current boundary
+
+This branch contains governed recovery for P1 reporting, global intraday and daily Alpha, legacy theme purity, GFF signal export and the checked-in daily label builder. `run_within_theme_alpha.py` still recovers at whole-report granularity. Warehouse-only scripts that are not checked into this repository, including local EOD or intraday label builders, are not silently treated as fixed; they must adopt the same shard and checkpoint contract separately.
