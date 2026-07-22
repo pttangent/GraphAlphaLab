@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 
 $wt = 'C:\Users\A001\.config\superpowers\worktrees\GraphAlphaLab\gal-report-9e67'
 $exe = Join-Path $wt '.venv\Scripts\gal.exe'
-$head = '9e67c2cbd1a713652c16ae41fe3704624950f2bc'
+$head = (& git -C $wt rev-parse HEAD).Trim()
 $root = 'D:\DEV\AnotherNetworkFactory\warehouses\GAL_warehouse'
 $gff = 'D:\DEV\AnotherNetworkFactory\warehouses\GFF_warehouse'
 $metadata = Join-Path $root 'metadata\symbol_metadata.parquet'
@@ -11,7 +11,18 @@ $schedulerLog = Join-Path $logs 'scheduler.log'
 $maxParallel = 3
 New-Item -ItemType Directory -Force $logs | Out-Null
 
+# Similarity is first so its consensus memberships become available to the
+# within-theme alpha scheduler as early as possible. All three jobs may still
+# run concurrently; this is priority, not a false serial dependency.
 $jobs = @(
+  @{
+    Name = 'similarity10_p1'
+    Batch = 'similarity10'
+    P1 = "$gff\similarity_p1_recursive_20260601_20260717\p1"
+    Range = "$gff\similarity_range_recursive_20260601_20260717\similarity_p1_range"
+    Dimensions = 'sector_code,industry_code,country,market_cap_bucket'
+    Extra = @('--require-consensus')
+  },
   @{
     Name = 'implemented27_p1'
     Batch = 'implemented27'
@@ -27,14 +38,6 @@ $jobs = @(
     Range = $null
     Dimensions = 'sector_code,industry_code,country,market_cap_bucket'
     Extra = @()
-  },
-  @{
-    Name = 'similarity10_p1'
-    Batch = 'similarity10'
-    P1 = "$gff\similarity_p1_recursive_20260601_20260717\p1"
-    Range = "$gff\similarity_range_recursive_20260601_20260717\similarity_p1_range"
-    Dimensions = 'sector_code,industry_code,country,market_cap_bucket'
-    Extra = @('--require-consensus')
   }
 )
 
@@ -83,7 +86,7 @@ function Start-P1Job($jobSpec) {
   Write-SchedulerLog "STARTED $($jobSpec.Name)"
 }
 
-Write-SchedulerLog 'scheduler started'
+Write-SchedulerLog "scheduler started commit=$head"
 
 while ($true) {
   $activeNames = @(Get-ActiveP1Names)
