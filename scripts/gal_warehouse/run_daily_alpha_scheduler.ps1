@@ -1,8 +1,12 @@
+param(
+  [int]$MaxParallel = 3
+)
+
 $ErrorActionPreference = 'Stop'
 
 $wt = 'C:\Users\A001\.config\superpowers\worktrees\GraphAlphaLab\gal-report-9e67'
 $exe = Join-Path $wt '.venv\Scripts\gal.exe'
-$head = '9e67c2cbd1a713652c16ae41fe3704624950f2bc'
+$head = (& git -C $wt rev-parse HEAD).Trim()
 $root = 'D:\DEV\AnotherNetworkFactory\warehouses\GAL_warehouse'
 $metadata = Join-Path $root 'metadata\symbol_metadata.parquet'
 $labels = Join-Path $root 'labels\daily_forward.parquet'
@@ -10,7 +14,7 @@ $contracts = Join-Path $root 'contracts'
 $rthVerification = Join-Path $root 'label_diagnostics\daily_forward_rth_verified.json'
 $logs = Join-Path $root 'logs\daily_alpha'
 $schedulerLog = Join-Path $logs 'scheduler.log'
-$maxParallel = 10
+$maxParallel = [Math]::Max(1, $MaxParallel)
 New-Item -ItemType Directory -Force $logs | Out-Null
 
 function Write-SchedulerLog($message) {
@@ -33,7 +37,7 @@ function Get-ActiveDailyAlphaNames {
 }
 
 if (-not (Test-Path $labels)) {
-  throw "Daily label file is missing: $labels. Run build_bars_labels.py first."
+  throw "Daily label file is missing: $labels. Run build_daily_labels_only.py first."
 }
 
 if (-not (Test-Path $rthVerification)) {
@@ -50,7 +54,7 @@ $labelIds = Get-ChildItem -LiteralPath $contracts -Filter 'daily_*.json' |
   Sort-Object
 
 if ($labelIds.Count -eq 0) {
-  throw "No daily label contracts found under $contracts. Run build_bars_labels.py first."
+  throw "No daily label contracts found under $contracts. Run build_daily_labels_only.py first."
 }
 
 $jobs = @()
@@ -94,7 +98,7 @@ function Start-DailyAlphaJob($jobSpec) {
   Write-SchedulerLog "STARTED $($jobSpec.Name)"
 }
 
-Write-SchedulerLog ("scheduler started; job_count={0}; max_parallel={1}" -f $jobs.Count, $maxParallel)
+Write-SchedulerLog ("scheduler started; commit={0}; job_count={1}; max_parallel={2}" -f $head, $jobs.Count, $maxParallel)
 
 while ($true) {
   $activeNames = @(Get-ActiveDailyAlphaNames)
