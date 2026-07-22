@@ -12,6 +12,16 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+from graphalphalab.checkpoint import (
+    CheckpointSpec,
+    checkpoint_valid,
+    commit_frames,
+    load_checkpoint_frames,
+    safe_key,
+    write_progress,
+)
+from graphalphalab.governance import atomic_write_json, atomic_write_text, sha256_json
+
 
 def csv_list(value: str | None) -> list[str]:
     return [x.strip() for x in (value or "").split(",") if x.strip()]
@@ -255,6 +265,18 @@ def write_frame(frame: pd.DataFrame, root: Path, name: str) -> None:
     frame.to_csv(root / f"{name}.csv", index=False)
 
 
+def checkpoint_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty and len(frame.columns) == 0:
+        return pd.DataFrame({"_checkpoint_empty": pd.Series(dtype="int8")})
+    return frame
+
+
+def restore_checkpoint_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    if list(frame.columns) == ["_checkpoint_empty"]:
+        return pd.DataFrame()
+    return frame
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Evaluate IG27/RM14 graph scores inside lagged Similarity consensus Leiden themes")
     p.add_argument("--batch-id", required=True)
@@ -276,6 +298,7 @@ def main() -> None:
     p.add_argument("--temp-directory", type=Path)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--force", action="store_true")
+    p.add_argument("--reset-checkpoints", action="store_true")
     args = p.parse_args()
 
     contract = json.loads(args.label_contract.read_text(encoding="utf-8"))
@@ -284,14 +307,17 @@ def main() -> None:
     factor_filter, variant_filter = set(csv_list(args.factor_ids)), set(csv_list(args.variant_ids))
     controls, costs = csv_list(args.control_columns), [float(x) for x in csv_list(args.cost_bps)]
     output = args.output.expanduser().resolve()
-    if output.exists():
-        if not args.force:
-            raise FileExistsError(f"Output already exists: {output}")
-        shutil.rmtree(output)
+    if output.exists() and (output / "_SUCCESS").exists() and not args.force:
+        raise FileExistsError(f"Output already exists and is complete: {output}")
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "_SUCCESS").unlink(missing_ok=True)
     pending = output.with_name(f".{output.name}.pending")
     if pending.exists():
-        shutil.rmtree(pending)
-    pending.mkdir(parents=True)
+        shutil.rmtree(pending, ignore_errors=True)
+    checkpoint_root = output / "_checkpoints" / "within_theme_factor"
+    if args.reset_checkpoints and checkpoint_root.exists():
+        shutil.rmtree(checkpoint_root, ignore_errors=True)
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
 
     con = duckdb.connect()
     con.execute(f"PRAGMA threads={max(1, args.threads)}")
@@ -358,8 +384,90 @@ def main() -> None:
 
     projection_cols = list(dict.fromkeys([*key_columns, "trade_date", "decision_time", "symbol_id", "score", *[c for c in controls if c in signal_cols]]))
     projection = ", ".join(f's."{c}"' for c in projection_cols)
+    run_contract_hash = sha256_json(
+        {
+            "operation": "lagged_similarity_leiden_within_theme_alpha",
+            "batch_id": args.batch_id,
+            "signals": str(args.signals.resolve()),
+            "labels": str(args.labels.resolve()),
+            "label_contract": str(args.label_contract.resolve()),
+            "label_contract_payload": contract,
+            "memberships": str(args.memberships.resolve()),
+            "label_id": label_id,
+            "theme_layer_id": args.theme_layer_id,
+            "factor_ids": sorted(factor_filter),
+            "variant_ids": sorted(variant_filter),
+            "default_direction": args.default_direction,
+            "quantiles": args.quantiles,
+            "min_theme_size": args.min_theme_size,
+            "min_themes_per_decision": args.min_themes_per_decision,
+            "control_columns": controls,
+            "cost_bps": costs,
+            "key_columns": key_columns,
+        }
+    )
+    required_checkpoint_files = ("metrics.parquet", "ic_series.parquet", "portfolio_returns.parquet", "theme_returns.parquet")
     metric_rows, ic_frames, portfolio_frames, theme_frames = [], [], [], []
+    units: list[dict[str, object]] = []
+    completed = 0
+    reused = 0
+    write_progress(
+        output,
+        stage="within-theme-factor-checkpoints",
+        total=len(factors),
+        completed=0,
+        current=None,
+        units=units,
+        extra={"checkpoint_contract_hash": run_contract_hash},
+    )
     for _, factor_row in factors.iterrows():
+        identity = {c: factor_row[c] for c in key_columns}
+        unit_name = "|".join(f"{key}={identity[key]}" for key in key_columns)
+        unit_dir = checkpoint_root / safe_key(identity, prefix="factor")
+        checkpoint_spec = CheckpointSpec(
+            "within-theme-factor",
+            unit_name,
+            run_contract_hash,
+            sha256_json(identity),
+        )
+        write_progress(
+            output,
+            stage="within-theme-factor-checkpoints",
+            total=len(factors),
+            completed=completed,
+            reused=reused,
+            current=unit_name,
+            units=units,
+            extra={"checkpoint_contract_hash": run_contract_hash},
+        )
+        if checkpoint_valid(unit_dir, checkpoint_spec, required_files=required_checkpoint_files):
+            loaded = load_checkpoint_frames(unit_dir, required_checkpoint_files)
+            metric_frame = restore_checkpoint_frame(loaded["metrics.parquet"])
+            ic = restore_checkpoint_frame(loaded["ic_series.parquet"])
+            portfolio = restore_checkpoint_frame(loaded["portfolio_returns.parquet"])
+            themes = restore_checkpoint_frame(loaded["theme_returns.parquet"])
+            if not metric_frame.empty:
+                metric_rows.extend(metric_frame.to_dict("records"))
+            if not ic.empty:
+                ic_frames.append(ic)
+            if not portfolio.empty:
+                portfolio_frames.append(portfolio)
+            if not themes.empty:
+                theme_frames.append(themes)
+            completed += 1
+            reused += 1
+            units.append({"unit": unit_name, "status": "reused", "attempt": 0, "detail": str(unit_dir)})
+            write_progress(
+                output,
+                stage="within-theme-factor-checkpoints",
+                total=len(factors),
+                completed=completed,
+                reused=reused,
+                current=None,
+                units=units,
+                extra={"checkpoint_contract_hash": run_contract_hash},
+            )
+            continue
         query = f"""
             WITH sl AS (
               SELECT {projection}, l."{target}"::DOUBLE target_return
@@ -376,7 +484,6 @@ def main() -> None:
             ORDER BY sl.trade_date, sl.decision_time, m.theme_id, sl.symbol_id
         """
         frame = con.execute(query).fetch_df()
-        identity = {c: factor_row[c] for c in key_columns}
         metric, ic, portfolio, themes = evaluate_factor(
             frame, identity, quantiles=args.quantiles, min_theme_size=args.min_theme_size,
             min_themes=args.min_themes_per_decision, direction_mode=args.default_direction,
@@ -389,6 +496,29 @@ def main() -> None:
             portfolio_frames.append(portfolio)
         if not themes.empty:
             theme_frames.append(themes)
+        commit_frames(
+            unit_dir,
+            checkpoint_spec,
+            {
+                "metrics.parquet": checkpoint_frame(pd.DataFrame([metric])),
+                "ic_series.parquet": checkpoint_frame(ic),
+                "portfolio_returns.parquet": checkpoint_frame(portfolio),
+                "theme_returns.parquet": checkpoint_frame(themes),
+            },
+            metadata={"identity": identity, "label_id": label_id},
+        )
+        completed += 1
+        units.append({"unit": unit_name, "status": "complete", "attempt": 1, "detail": str(unit_dir)})
+        write_progress(
+            output,
+            stage="within-theme-factor-checkpoints",
+            total=len(factors),
+            completed=completed,
+            reused=reused,
+            current=None,
+            units=units,
+            extra={"checkpoint_contract_hash": run_contract_hash},
+        )
 
     metrics = pd.DataFrame(metric_rows)
     if "spearman_ic_pvalue_daily" in metrics:
@@ -403,7 +533,7 @@ def main() -> None:
     portfolios = pd.concat(portfolio_frames, ignore_index=True) if portfolio_frames else pd.DataFrame()
     theme_returns = pd.concat(theme_frames, ignore_index=True) if theme_frames else pd.DataFrame()
     for name, frame in (("metrics", metrics), ("ic_series", ic), ("portfolio_returns", portfolios), ("theme_returns", theme_returns)):
-        write_frame(frame, pending, name)
+        write_frame(frame, output, name)
     manifest = {
         "operation": "lagged_similarity_leiden_within_theme_alpha", "batch_id": args.batch_id,
         "signals": str(args.signals.resolve()), "labels": str(args.labels.resolve()),
@@ -415,16 +545,29 @@ def main() -> None:
         "control_columns": controls, "cost_bps": costs, "membership_audit": audit,
         "factor_count": int(len(metrics)), "decision_rows": int(len(portfolios)),
         "theme_decision_rows": int(len(theme_returns)),
+        "checkpoint_granularity": "factor",
+        "checkpoint_count": int(len(factors)),
+        "checkpoint_reused": int(reused),
+        "checkpoint_contract_hash": run_contract_hash,
     }
-    (pending / "run_manifest.json").write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
-    (pending / "SUMMARY.md").write_text(
+    atomic_write_json(output / "run_manifest.json", manifest)
+    atomic_write_text(
+        output / "SUMMARY.md",
         "# Lagged Similarity-Leiden Within-Theme Alpha\n\n```json\n" + json.dumps(audit, indent=2) + "\n```\n\n```csv\n" + metrics.to_csv(index=False) + "```\n",
-        encoding="utf-8",
     )
-    (pending / "_SUCCESS").write_text(json.dumps({"status": "success", "factor_count": len(metrics)}, indent=2), encoding="utf-8")
+    atomic_write_json(output / "_SUCCESS", {"status": "success", "factor_count": len(metrics), "checkpoint_contract_hash": run_contract_hash})
+    write_progress(
+        output,
+        stage="within-theme-factor-checkpoints",
+        total=len(factors),
+        completed=completed,
+        reused=reused,
+        current=None,
+        status="complete",
+        units=units,
+        extra={"checkpoint_contract_hash": run_contract_hash, "report_success": True},
+    )
     con.close()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(pending, output)
     print(json.dumps(manifest, indent=2, default=str))
 
 
