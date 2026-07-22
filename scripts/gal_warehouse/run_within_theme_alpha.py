@@ -64,6 +64,51 @@ def ttest(values: pd.Series) -> tuple[float, float]:
     return t, float(2 * stats.t.sf(abs(t), len(clean) - 1))
 
 
+def theme_size_bucket(size: int) -> str:
+    if size <= 2:
+        return "pair"
+    if size <= 5:
+        return "micro"
+    if size <= 19:
+        return "small"
+    if size <= 49:
+        return "standard"
+    return "large"
+
+
+def adaptive_tail_count(size: int, quantiles: int) -> int:
+    if size <= 4:
+        return 1
+    if size <= 9:
+        return min(2, size // 2)
+    if size <= 19:
+        return min(3, size // 2)
+    return max(1, int(math.ceil(size / max(2, quantiles))))
+
+
+def adaptive_method(size: int) -> str:
+    if size <= 2:
+        return "pair_spread"
+    if size <= 4:
+        return "extreme_ordering"
+    if size <= 19:
+        return "adaptive_tails"
+    return "quintile_tails"
+
+
+def assign_adaptive_tails(group: pd.DataFrame, quantiles: int) -> pd.DataFrame:
+    result = group.sort_values("_score", kind="mergesort").copy()
+    size = int(len(result))
+    tail = adaptive_tail_count(size, quantiles)
+    result["_tail_side"] = 0
+    result.iloc[:tail, result.columns.get_loc("_tail_side")] = -1
+    result.iloc[-tail:, result.columns.get_loc("_tail_side")] = 1
+    result["theme_size_bucket"] = theme_size_bucket(size)
+    result["selection_method"] = adaptive_method(size)
+    result["tail_count"] = tail
+    return result.sort_index()
+
+
 def bh_fdr(values: pd.Series) -> pd.Series:
     raw = pd.to_numeric(values, errors="coerce")
     valid = raw.dropna().sort_values()
@@ -116,6 +161,9 @@ def evaluate_factor(
     costs: list[float],
 ) -> tuple[dict[str, object], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     data = frame.copy()
+    required = {"decision_time", "theme_decision_time", "theme_id", "symbol_id", "score", "target_return"}
+    if data.empty or not required.issubset(data.columns):
+        return {**identity, "decision_count": 0, "sample_sufficient": False, "research_status": "insufficient_or_rejected"}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     for column in ("decision_time", "theme_decision_time"):
         data[column] = pd.to_datetime(data[column], utc=True, errors="coerce")
     for column in ("score", "target_return", *controls):
@@ -133,9 +181,11 @@ def evaluate_factor(
     if data.empty:
         return {**identity, "decision_count": 0, "sample_sufficient": False, "research_status": "insufficient_or_rejected"}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    data["_rank"] = data.groupby(group_keys, observed=True)["_score"].rank(method="first", pct=True)
-    data["_quantile"] = np.minimum(np.ceil(data["_rank"] * quantiles).astype(int), quantiles)
     data["_theme_n"] = data.groupby(group_keys, observed=True)["symbol_id"].transform("nunique")
+    data = pd.concat(
+        [assign_adaptive_tails(group, quantiles) for _, group in data.groupby(group_keys, observed=True, sort=False)],
+        ignore_index=False,
+    ).sort_index()
 
     theme_stats = (
         data.groupby(group_keys, observed=True)
@@ -143,12 +193,15 @@ def evaluate_factor(
             lambda g: pd.Series(
                 {
                     "theme_member_count": len(g),
+                    "theme_size_bucket": g["theme_size_bucket"].iloc[0],
+                    "selection_method": g["selection_method"].iloc[0],
+                    "tail_count": int(g["tail_count"].iloc[0]),
                     "spearman_ic": safe_corr(g, "spearman"),
                     "pearson_ic": safe_corr(g, "pearson"),
-                    "raw_top_minus_bottom_return": g.loc[g["_quantile"] == quantiles, "target_return"].mean()
-                    - g.loc[g["_quantile"] == 1, "target_return"].mean(),
-                    "long_high_n": int((g["_quantile"] == quantiles).sum()),
-                    "long_low_n": int((g["_quantile"] == 1).sum()),
+                    "raw_top_minus_bottom_return": g.loc[g["_tail_side"] == 1, "target_return"].mean()
+                    - g.loc[g["_tail_side"] == -1, "target_return"].mean(),
+                    "long_high_n": int((g["_tail_side"] == 1).sum()),
+                    "long_low_n": int((g["_tail_side"] == -1).sum()),
                 }
             ),
             include_groups=False,
@@ -185,7 +238,7 @@ def evaluate_factor(
     theme_stats["oriented_long_short_return"] = theme_stats["raw_top_minus_bottom_return"] * direction
     theme_stats = theme_stats.assign(**identity)
 
-    data["_side"] = np.where(data["_quantile"] == quantiles, 1, np.where(data["_quantile"] == 1, -1, 0))
+    data["_side"] = data["_tail_side"].astype(int)
     if direction < 0:
         data["_side"] *= -1
     selected = data[data["_side"] != 0].copy()
@@ -227,6 +280,7 @@ def evaluate_factor(
     metric = {
         **identity,
         "portfolio_mode": "lagged_similarity_leiden_within_theme_equal_theme",
+        "theme_selection_mode": "adaptive_by_theme_size",
         "observations": int(len(data)),
         "decision_count": int(len(portfolio)),
         "date_count": int(portfolio["trade_date"].nunique()),
@@ -253,6 +307,8 @@ def evaluate_factor(
         "theme_lag_safe": lag_violations == 0,
         "sample_sufficient": bool(portfolio["trade_date"].nunique() >= 20 and len(portfolio) >= 100 and len(data) >= 500),
     }
+    for bucket in ("pair", "micro", "small", "standard", "large"):
+        metric[f"{bucket}_theme_decisions"] = int((theme_stats["theme_size_bucket"] == bucket).sum())
     for cost in costs:
         metric[f"net_mean_{cost:g}bps"] = float(portfolio[f"net_return_{cost:g}bps"].mean())
     metric["cost_survives_5bps"] = bool(metric.get("net_mean_5bps", np.nan) > 0)
@@ -289,7 +345,7 @@ def main() -> None:
     p.add_argument("--variant-ids", default="graph_forward")
     p.add_argument("--default-direction", choices=("auto", "positive", "negative"), default="auto")
     p.add_argument("--quantiles", type=int, default=5)
-    p.add_argument("--min-theme-size", type=int, default=20)
+    p.add_argument("--min-theme-size", type=int, default=2)
     p.add_argument("--min-themes-per-decision", type=int, default=2)
     p.add_argument("--control-columns", default="own_score")
     p.add_argument("--cost-bps", default="0,1,2,5,10")
@@ -314,7 +370,7 @@ def main() -> None:
     pending = output.with_name(f".{output.name}.pending")
     if pending.exists():
         shutil.rmtree(pending, ignore_errors=True)
-    checkpoint_root = output / "_checkpoints" / "within_theme_factor"
+    checkpoint_root = output / "_checkpoints" / "within_theme_factor_date"
     if args.reset_checkpoints and checkpoint_root.exists():
         shutil.rmtree(checkpoint_root, ignore_errors=True)
     checkpoint_root.mkdir(parents=True, exist_ok=True)
@@ -406,15 +462,29 @@ def main() -> None:
             "key_columns": key_columns,
         }
     )
-    required_checkpoint_files = ("metrics.parquet", "ic_series.parquet", "portfolio_returns.parquet", "theme_returns.parquet")
+    required_checkpoint_files = ("joined.parquet",)
     metric_rows, ic_frames, portfolio_frames, theme_frames = [], [], [], []
     units: list[dict[str, object]] = []
+    factor_dates: list[tuple[pd.Series, str]] = []
+    for _, factor_row in factors.iterrows():
+        dates = con.execute(
+            f"""
+            SELECT DISTINCT CAST(s.trade_date AS VARCHAR) AS trade_date
+            FROM signals s JOIN labels l
+              ON s.trade_date=l.trade_date AND s.decision_time=l.decision_time AND s.symbol_id=l.symbol_id
+            WHERE {factor_condition(key_columns, factor_row)}
+              AND CAST(l.label_id AS VARCHAR)={sql_literal(label_id)}
+            ORDER BY trade_date
+            """
+        ).fetch_df()
+        for trade_date in dates["trade_date"].astype(str).tolist():
+            factor_dates.append((factor_row, trade_date))
     completed = 0
     reused = 0
     write_progress(
         output,
-        stage="within-theme-factor-checkpoints",
-        total=len(factors),
+        stage="within-theme-factor-date-checkpoints",
+        total=len(factor_dates),
         completed=0,
         current=None,
         units=units,
@@ -422,68 +492,83 @@ def main() -> None:
     )
     for _, factor_row in factors.iterrows():
         identity = {c: factor_row[c] for c in key_columns}
-        unit_name = "|".join(f"{key}={identity[key]}" for key in key_columns)
-        unit_dir = checkpoint_root / safe_key(identity, prefix="factor")
-        checkpoint_spec = CheckpointSpec(
-            "within-theme-factor",
-            unit_name,
-            run_contract_hash,
-            sha256_json(identity),
-        )
-        write_progress(
-            output,
-            stage="within-theme-factor-checkpoints",
-            total=len(factors),
-            completed=completed,
-            reused=reused,
-            current=unit_name,
-            units=units,
-            extra={"checkpoint_contract_hash": run_contract_hash},
-        )
-        if checkpoint_valid(unit_dir, checkpoint_spec, required_files=required_checkpoint_files):
-            loaded = load_checkpoint_frames(unit_dir, required_checkpoint_files)
-            metric_frame = restore_checkpoint_frame(loaded["metrics.parquet"])
-            ic = restore_checkpoint_frame(loaded["ic_series.parquet"])
-            portfolio = restore_checkpoint_frame(loaded["portfolio_returns.parquet"])
-            themes = restore_checkpoint_frame(loaded["theme_returns.parquet"])
-            if not metric_frame.empty:
-                metric_rows.extend(metric_frame.to_dict("records"))
-            if not ic.empty:
-                ic_frames.append(ic)
-            if not portfolio.empty:
-                portfolio_frames.append(portfolio)
-            if not themes.empty:
-                theme_frames.append(themes)
-            completed += 1
-            reused += 1
-            units.append({"unit": unit_name, "status": "reused", "attempt": 0, "detail": str(unit_dir)})
+        factor_frames: list[pd.DataFrame] = []
+        factor_trade_dates = [trade_date for row, trade_date in factor_dates if row.equals(factor_row)]
+        for trade_date in factor_trade_dates:
+            unit_identity = {**identity, "trade_date": trade_date}
+            unit_name = "|".join(f"{key}={unit_identity[key]}" for key in [*key_columns, "trade_date"])
+            unit_dir = checkpoint_root / safe_key(unit_identity, prefix="factor-date")
+            checkpoint_spec = CheckpointSpec(
+                "within-theme-factor-date",
+                unit_name,
+                run_contract_hash,
+                sha256_json(unit_identity),
+            )
             write_progress(
                 output,
-                stage="within-theme-factor-checkpoints",
-                total=len(factors),
+                stage="within-theme-factor-date-checkpoints",
+                total=len(factor_dates),
+                completed=completed,
+                reused=reused,
+                current=unit_name,
+                units=units,
+                extra={"checkpoint_contract_hash": run_contract_hash},
+            )
+            if checkpoint_valid(unit_dir, checkpoint_spec, required_files=required_checkpoint_files):
+                loaded = load_checkpoint_frames(unit_dir, required_checkpoint_files)
+                frame = restore_checkpoint_frame(loaded["joined.parquet"])
+                factor_frames.append(frame)
+                completed += 1
+                reused += 1
+                units.append({"unit": unit_name, "status": "reused", "attempt": 0, "detail": str(unit_dir)})
+                write_progress(
+                    output,
+                    stage="within-theme-factor-date-checkpoints",
+                    total=len(factor_dates),
+                    completed=completed,
+                    reused=reused,
+                    current=None,
+                    units=units,
+                    extra={"checkpoint_contract_hash": run_contract_hash},
+                )
+                continue
+            query = f"""
+                WITH sl AS (
+                  SELECT {projection}, l."{target}"::DOUBLE target_return
+                  FROM signals s JOIN labels l
+                    ON s.trade_date=l.trade_date AND s.decision_time=l.decision_time AND s.symbol_id=l.symbol_id
+                  WHERE {factor_condition(key_columns, factor_row)}
+                    AND CAST(s.trade_date AS VARCHAR)={sql_literal(trade_date)}
+                    AND CAST(l.label_id AS VARCHAR)={sql_literal(label_id)}
+                )
+                SELECT sl.*, m.theme_id, m.theme_size, m.tree_depth, m.theme_decision_time
+                FROM sl ASOF LEFT JOIN canonical_memberships m
+                  ON sl.symbol_id=m.symbol_id AND CAST(sl.trade_date AS VARCHAR)=m.trade_date
+                 AND sl.decision_time > m.theme_decision_time
+                WHERE m.theme_id IS NOT NULL
+                ORDER BY sl.trade_date, sl.decision_time, m.theme_id, sl.symbol_id
+            """
+            frame = con.execute(query).fetch_df()
+            commit_frames(
+                unit_dir,
+                checkpoint_spec,
+                {"joined.parquet": checkpoint_frame(frame)},
+                metadata={"identity": unit_identity, "label_id": label_id},
+            )
+            factor_frames.append(frame)
+            completed += 1
+            units.append({"unit": unit_name, "status": "complete", "attempt": 1, "detail": str(unit_dir)})
+            write_progress(
+                output,
+                stage="within-theme-factor-date-checkpoints",
+                total=len(factor_dates),
                 completed=completed,
                 reused=reused,
                 current=None,
                 units=units,
                 extra={"checkpoint_contract_hash": run_contract_hash},
             )
-            continue
-        query = f"""
-            WITH sl AS (
-              SELECT {projection}, l."{target}"::DOUBLE target_return
-              FROM signals s JOIN labels l
-                ON s.trade_date=l.trade_date AND s.decision_time=l.decision_time AND s.symbol_id=l.symbol_id
-              WHERE {factor_condition(key_columns, factor_row)}
-                AND CAST(l.label_id AS VARCHAR)={sql_literal(label_id)}
-            )
-            SELECT sl.*, m.theme_id, m.theme_size, m.tree_depth, m.theme_decision_time
-            FROM sl ASOF LEFT JOIN canonical_memberships m
-              ON sl.symbol_id=m.symbol_id AND CAST(sl.trade_date AS VARCHAR)=m.trade_date
-             AND sl.decision_time > m.theme_decision_time
-            WHERE m.theme_id IS NOT NULL
-            ORDER BY sl.trade_date, sl.decision_time, m.theme_id, sl.symbol_id
-        """
-        frame = con.execute(query).fetch_df()
+        frame = pd.concat(factor_frames, ignore_index=True) if factor_frames else pd.DataFrame()
         metric, ic, portfolio, themes = evaluate_factor(
             frame, identity, quantiles=args.quantiles, min_theme_size=args.min_theme_size,
             min_themes=args.min_themes_per_decision, direction_mode=args.default_direction,
@@ -496,29 +581,6 @@ def main() -> None:
             portfolio_frames.append(portfolio)
         if not themes.empty:
             theme_frames.append(themes)
-        commit_frames(
-            unit_dir,
-            checkpoint_spec,
-            {
-                "metrics.parquet": checkpoint_frame(pd.DataFrame([metric])),
-                "ic_series.parquet": checkpoint_frame(ic),
-                "portfolio_returns.parquet": checkpoint_frame(portfolio),
-                "theme_returns.parquet": checkpoint_frame(themes),
-            },
-            metadata={"identity": identity, "label_id": label_id},
-        )
-        completed += 1
-        units.append({"unit": unit_name, "status": "complete", "attempt": 1, "detail": str(unit_dir)})
-        write_progress(
-            output,
-            stage="within-theme-factor-checkpoints",
-            total=len(factors),
-            completed=completed,
-            reused=reused,
-            current=None,
-            units=units,
-            extra={"checkpoint_contract_hash": run_contract_hash},
-        )
 
     metrics = pd.DataFrame(metric_rows)
     if "spearman_ic_pvalue_daily" in metrics:
@@ -532,7 +594,31 @@ def main() -> None:
     ic = pd.concat(ic_frames, ignore_index=True) if ic_frames else pd.DataFrame()
     portfolios = pd.concat(portfolio_frames, ignore_index=True) if portfolio_frames else pd.DataFrame()
     theme_returns = pd.concat(theme_frames, ignore_index=True) if theme_frames else pd.DataFrame()
-    for name, frame in (("metrics", metrics), ("ic_series", ic), ("portfolio_returns", portfolios), ("theme_returns", theme_returns)):
+    if not theme_returns.empty and "theme_size_bucket" in theme_returns:
+        bucket_group_cols = [column for column in key_columns if column in theme_returns.columns]
+        bucket_group_cols.append("theme_size_bucket")
+        bucket_metrics = (
+            theme_returns.groupby(bucket_group_cols, observed=True)
+            .agg(
+                theme_decisions=("theme_id", "count"),
+                unique_themes=("theme_id", "nunique"),
+                mean_theme_members=("theme_member_count", "mean"),
+                mean_tail_count=("tail_count", "mean"),
+                mean_spearman_ic=("spearman_ic", "mean"),
+                raw_top_minus_bottom_mean=("raw_top_minus_bottom_return", "mean"),
+                oriented_long_short_mean=("oriented_long_short_return", "mean"),
+            )
+            .reset_index()
+        )
+    else:
+        bucket_metrics = pd.DataFrame()
+    for name, frame in (
+        ("metrics", metrics),
+        ("ic_series", ic),
+        ("portfolio_returns", portfolios),
+        ("theme_returns", theme_returns),
+        ("bucket_metrics", bucket_metrics),
+    ):
         write_frame(frame, output, name)
     manifest = {
         "operation": "lagged_similarity_leiden_within_theme_alpha", "batch_id": args.batch_id,
@@ -545,8 +631,9 @@ def main() -> None:
         "control_columns": controls, "cost_bps": costs, "membership_audit": audit,
         "factor_count": int(len(metrics)), "decision_rows": int(len(portfolios)),
         "theme_decision_rows": int(len(theme_returns)),
-        "checkpoint_granularity": "factor",
-        "checkpoint_count": int(len(factors)),
+        "bucket_metric_rows": int(len(bucket_metrics)),
+        "checkpoint_granularity": "factor_date_joined_frame",
+        "checkpoint_count": int(len(factor_dates)),
         "checkpoint_reused": int(reused),
         "checkpoint_contract_hash": run_contract_hash,
     }
@@ -558,8 +645,8 @@ def main() -> None:
     atomic_write_json(output / "_SUCCESS", {"status": "success", "factor_count": len(metrics), "checkpoint_contract_hash": run_contract_hash})
     write_progress(
         output,
-        stage="within-theme-factor-checkpoints",
-        total=len(factors),
+        stage="within-theme-factor-date-checkpoints",
+        total=len(factor_dates),
         completed=completed,
         reused=reused,
         current=None,
