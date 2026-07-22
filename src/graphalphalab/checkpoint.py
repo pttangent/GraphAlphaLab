@@ -9,6 +9,7 @@ import shutil
 from typing import Iterable
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 from .governance import atomic_write_frame, atomic_write_json, sha256_file, sha256_json
 
@@ -139,6 +140,14 @@ def checkpoint_valid(
             return False
         if str(record.get("sha256")) != sha256_file(file_path):
             return False
+        expected_rows = record.get("rows")
+        if expected_rows is not None and file_path.suffix.lower() in {".parquet", ".pq"}:
+            try:
+                actual_rows = int(pq.ParquetFile(file_path).metadata.num_rows)
+            except Exception:
+                return False
+            if int(expected_rows) != actual_rows:
+                return False
     return True
 
 
