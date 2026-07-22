@@ -115,9 +115,8 @@ def evaluate_factor(
     lag_violations = int((data["theme_decision_time"] >= data["decision_time"]).sum())
 
     group_keys = ["trade_date", "decision_time", "theme_id"]
-    data["_score"] = data.groupby(group_keys, observed=True, group_keys=False).apply(
-        lambda g: residualize(g, controls), include_groups=False
-    ).reset_index(level=group_keys, drop=True)
+    score_parts = [residualize(group, controls) for _, group in data.groupby(group_keys, observed=True, sort=False)]
+    data["_score"] = pd.concat(score_parts).sort_index() if score_parts else np.nan
     data = data.dropna(subset=["_score"])
     sizes = data.groupby(group_keys, observed=True)["symbol_id"].transform("nunique")
     data = data[sizes >= min_theme_size].copy()
