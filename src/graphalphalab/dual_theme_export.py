@@ -14,6 +14,8 @@ from .dual_theme_common import (
     DualThemeExportSummary,
     _sql_path,
     discover_dual_theme_partitions,
+    load_gff_campaign_contract,
+    validate_partition_inventory,
 )
 from .dual_theme_sql import _inter_query, _partition_metadata, _stock_query
 from .governance import (
@@ -37,19 +39,39 @@ def export_dual_theme_signals(
     resource_budget: ResourceBudget = ResourceBudget(),
     expected_git_commit: str | None = None,
     require_clean: bool = False,
+    require_campaign_success: bool = True,
     force: bool = False,
 ) -> DualThemeExportSummary:
     campaign = Path(campaign_root).expanduser().resolve()
     output = Path(output_root).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    selected_families = tuple(dict.fromkeys(str(value).strip() for value in theme_families if str(value).strip()))
-    selected_scopes = tuple(dict.fromkeys(str(value).strip() for value in scopes if str(value).strip()))
-    requested_variants = tuple(dict.fromkeys(str(value).strip() for value in variants if str(value).strip()))
+    (output / "_SUCCESS").unlink(missing_ok=True)
+    campaign_success = campaign / "_SUCCESS"
+    if require_campaign_success and not campaign_success.exists():
+        raise FileNotFoundError(f"GFF campaign is not complete: {campaign_success}")
+    campaign_contract = load_gff_campaign_contract(campaign)
+    selected_families = tuple(
+        dict.fromkeys(
+            str(value).strip() for value in theme_families if str(value).strip()
+        )
+    )
+    selected_scopes = tuple(
+        dict.fromkeys(str(value).strip() for value in scopes if str(value).strip())
+    )
+    requested_variants = tuple(
+        dict.fromkeys(str(value).strip() for value in variants if str(value).strip())
+    )
     unknown = sorted(set(requested_variants) - set(SUPPORTED_VARIANTS))
     if unknown:
         raise ValueError(f"Unsupported variants: {unknown}")
     partitions = discover_dual_theme_partitions(
         campaign,
+        theme_families=selected_families,
+        scopes=selected_scopes,
+    )
+    inventory = validate_partition_inventory(
+        partitions,
+        campaign_contract,
         theme_families=selected_families,
         scopes=selected_scopes,
     )
@@ -64,7 +86,9 @@ def export_dual_theme_signals(
     for partition in partitions:
         meta = _partition_metadata(connection, partition)
         if int(meta["pit_violations"]):
-            raise ValueError(f"GFF edge PIT violation in {partition.edges}: {meta['pit_violations']}")
+            raise ValueError(
+                f"GFF edge PIT violation in {partition.edges}: {meta['pit_violations']}"
+            )
         total_pit += int(meta["pit_violations"])
         inputs.extend([file_record(partition.edges), file_record(partition.nodes)])
         if partition.scope_memberships is not None:
@@ -88,14 +112,25 @@ def export_dual_theme_signals(
             if destination.exists() and not force:
                 rows = int(
                     connection.execute(
-                        f"SELECT count(*) FROM read_parquet('{_sql_path(destination)}', union_by_name=true)"
+                        f"SELECT count(*) FROM read_parquet('{_sql_path(destination)}', "
+                        "union_by_name=true)"
                     ).fetchone()[0]
                 )
             else:
                 query = (
-                    _inter_query(batch_id=batch_id, partition=partition, meta=meta, variant=variant)
+                    _inter_query(
+                        batch_id=batch_id,
+                        partition=partition,
+                        meta=meta,
+                        variant=variant,
+                    )
                     if partition.scope == "inter_theme"
-                    else _stock_query(batch_id=batch_id, partition=partition, meta=meta, variant=variant)
+                    else _stock_query(
+                        batch_id=batch_id,
+                        partition=partition,
+                        meta=meta,
+                        variant=variant,
+                    )
                 )
                 temporary = destination.with_name(f".{destination.name}.part")
                 temporary.unlink(missing_ok=True)
@@ -106,12 +141,15 @@ def export_dual_theme_signals(
                 temporary.replace(destination)
                 rows = int(
                     connection.execute(
-                        f"SELECT count(*) FROM read_parquet('{_sql_path(destination)}', union_by_name=true)"
+                        f"SELECT count(*) FROM read_parquet('{_sql_path(destination)}', "
+                        "union_by_name=true)"
                     ).fetchone()[0]
                 )
             total_rows += rows
             if rows > 0:
-                factor_keys.add((partition.scope, partition.theme_family, layer, scale, variant))
+                factor_keys.add(
+                    (partition.scope, partition.theme_family, layer, scale, variant)
+                )
                 key = f"{partition.scope}|{partition.theme_family}"
                 counts[key] = counts.get(key, 0) + 1
             record = file_record(destination)
@@ -127,10 +165,11 @@ def export_dual_theme_signals(
                 }
             )
             output_files.append(record)
-    campaign_contract = campaign / "runs" / "campaign_contract.json"
+    campaign_contract_path = Path(campaign_contract["path"])
     campaign_summary = campaign / "runs" / "campaign_summary.json"
-    if campaign_contract.exists():
-        inputs.append(file_record(campaign_contract))
+    inputs.append(file_record(campaign_contract_path))
+    if campaign_success.exists():
+        inputs.append(file_record(campaign_success))
     if campaign_summary.exists():
         inputs.append(file_record(campaign_summary))
     parameters = {
@@ -141,6 +180,8 @@ def export_dual_theme_signals(
         "scopes": list(selected_scopes),
         "variants": list(requested_variants),
         "factor_count": len(factor_keys),
+        "require_campaign_success": require_campaign_success,
+        "partition_inventory": inventory,
     }
     manifest = implementation_manifest(
         operation="export_dual_theme_gff_signals",
@@ -159,17 +200,25 @@ def export_dual_theme_signals(
             "output_files": output_files,
             "output_rows": total_rows,
             "factor_count": len(factor_keys),
-            "empty_output_file_count": sum(int(row.get("rows", 0)) == 0 for row in output_files),
+            "empty_output_file_count": sum(
+                int(row.get("rows", 0)) == 0 for row in output_files
+            ),
             "edge_pit_violations": total_pit,
             "counts_by_scope_family": counts,
-            "inter_theme_projection": "theme_node_signal_broadcast_to_canonical_scope_members",
+            "inter_theme_projection": (
+                "theme_node_signal_broadcast_to_canonical_scope_members"
+            ),
             "global_computation": "shared_once_across_theme_families",
+            "partition_inventory": inventory,
         }
     )
     atomic_write_json(output / "export_manifest.json", manifest)
     atomic_write_json(
         output / "_SUCCESS",
-        {"contract_hash": manifest["contract_hash"], "factor_count": len(factor_keys)},
+        {
+            "contract_hash": manifest["contract_hash"],
+            "factor_count": len(factor_keys),
+        },
     )
     return DualThemeExportSummary(
         len(partitions),
