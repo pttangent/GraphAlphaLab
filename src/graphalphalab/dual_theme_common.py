@@ -119,7 +119,11 @@ def load_horizon_manifest(path: str | Path) -> tuple[HorizonSpec, ...]:
     return tuple(rows)
 
 
-def _scope_membership_path(campaign_root: Path, theme_family: str, trade_date: str) -> Path:
+def _scope_membership_path(
+    campaign_root: Path,
+    theme_family: str,
+    trade_date: str,
+) -> Path:
     exact = (
         campaign_root
         / "graphs"
@@ -132,15 +136,108 @@ def _scope_membership_path(campaign_root: Path, theme_family: str, trade_date: s
     if exact.exists():
         return exact
     matches = sorted(
-        (campaign_root / "graphs" / "scope_index" / f"theme_family={theme_family}").rglob(
-            f"date={trade_date}/memberships.parquet"
-        )
+        (
+            campaign_root
+            / "graphs"
+            / "scope_index"
+            / f"theme_family={theme_family}"
+        ).rglob(f"date={trade_date}/memberships.parquet")
     )
     if len(matches) != 1:
         raise FileNotFoundError(
-            f"Expected one scope membership file for family={theme_family}, date={trade_date}; found={matches}"
+            f"Expected one scope membership file for family={theme_family}, "
+            f"date={trade_date}; found={matches}"
         )
     return matches[0]
+
+
+def load_gff_campaign_contract(campaign_root: str | Path) -> dict[str, object]:
+    root = Path(campaign_root).expanduser().resolve()
+    path = root / "runs" / "campaign_contract.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing governed GFF campaign contract: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    contract = payload.get("campaign_contract")
+    registry = payload.get("registry")
+    dates = payload.get("dates")
+    if not isinstance(contract, dict) or not isinstance(registry, dict) or not isinstance(dates, list):
+        raise ValueError(f"Malformed GFF campaign contract: {path}")
+    version = str(
+        registry.get("campaign_version")
+        or contract.get("campaign_version")
+        or payload.get("campaign_implementation_version")
+        or ""
+    )
+    if version != "SMI_DUAL_THEME_IGC_FULL_SCOPE_COMPARE_V1":
+        raise ValueError(
+            f"Unsupported GFF campaign version {version!r}; expected dual-theme V1"
+        )
+    consensus = registry.get("consensus", {})
+    if isinstance(consensus, dict) and bool(consensus.get("enabled")):
+        raise ValueError("Dual-theme GAL input must not enable Consensus")
+    families = tuple(str(value) for value in registry.get("theme_family_order", ()))
+    if families and families != DEFAULT_THEME_FAMILIES:
+        raise ValueError(f"Unexpected Theme families: {families}")
+    return {
+        "path": path,
+        "payload": payload,
+        "contract": contract,
+        "registry": registry,
+        "dates": dates,
+    }
+
+
+def validate_partition_inventory(
+    partitions: Iterable[P0Partition],
+    campaign_contract: dict[str, object],
+    *,
+    theme_families: Iterable[str],
+    scopes: Iterable[str],
+) -> dict[str, object]:
+    selected_families = tuple(theme_families)
+    selected_scopes = tuple(scopes)
+    rows = tuple(partitions)
+    counts: dict[str, int] = {}
+    for row in rows:
+        key = f"{row.scope}|{row.theme_family}"
+        counts[key] = counts.get(key, 0) + 1
+    registry = campaign_contract["registry"]
+    dates = campaign_contract["dates"]
+    if not isinstance(registry, dict) or not isinstance(dates, list):
+        raise ValueError("Invalid parsed GFF campaign contract")
+    date_count = len(dates)
+    if date_count < 1:
+        raise ValueError("GFF campaign contract has no dates")
+    expected_counts = registry.get("scope_contract_counts", {})
+    if not isinstance(expected_counts, dict):
+        raise ValueError("GFF registry is missing scope_contract_counts")
+    expected: dict[str, int] = {}
+    if "global" in selected_scopes:
+        expected["global|shared_global"] = int(expected_counts.get("global", 0)) * date_count
+    for family in selected_families:
+        if "within_theme" in selected_scopes:
+            expected[f"within_theme|{family}"] = int(
+                expected_counts.get(f"{family}_within_theme", 0)
+            ) * date_count
+        if "inter_theme" in selected_scopes:
+            expected[f"inter_theme|{family}"] = int(
+                expected_counts.get(f"{family}_inter_theme", 0)
+            ) * date_count
+    mismatches = {
+        key: {"expected": value, "observed": counts.get(key, 0)}
+        for key, value in expected.items()
+        if value <= 0 or counts.get(key, 0) != value
+    }
+    if mismatches:
+        raise ValueError(
+            f"Incomplete or unexpected dual-theme P0 inventory: {mismatches}"
+        )
+    return {
+        "date_count": date_count,
+        "expected_counts": expected,
+        "observed_counts": counts,
+        "complete": True,
+    }
 
 
 def discover_dual_theme_partitions(
@@ -152,11 +249,20 @@ def discover_dual_theme_partitions(
     root = Path(campaign_root).expanduser().resolve()
     if not root.exists():
         raise FileNotFoundError(root)
-    selected_families = tuple(dict.fromkeys(str(value).strip() for value in theme_families if str(value).strip()))
-    selected_scopes = tuple(dict.fromkeys(str(value).strip() for value in scopes if str(value).strip()))
+    selected_families = tuple(
+        dict.fromkeys(
+            str(value).strip() for value in theme_families if str(value).strip()
+        )
+    )
+    selected_scopes = tuple(
+        dict.fromkeys(str(value).strip() for value in scopes if str(value).strip())
+    )
     unknown_scopes = sorted(set(selected_scopes) - set(DEFAULT_SCOPES))
     if unknown_scopes:
         raise ValueError(f"Unsupported scopes: {unknown_scopes}")
+    unknown_families = sorted(set(selected_families) - set(DEFAULT_THEME_FAMILIES))
+    if unknown_families:
+        raise ValueError(f"Unsupported Theme families: {unknown_families}")
     rows: list[P0Partition] = []
     if "global" in selected_scopes:
         global_root = root / "graphs" / "scope=global" / "batch=IGC_DUAL_THEME_COMPARE"
