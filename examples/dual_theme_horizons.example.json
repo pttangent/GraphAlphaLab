@@ -1,0 +1,34 @@
+{
+  "horizons": [
+    {
+      "name": "5m",
+      "labels": "D:\\GAL\\labels\\forward_5m.parquet",
+      "label_contract": "D:\\GAL\\contracts\\forward_5m.json"
+    },
+    {
+      "name": "15m",
+      "labels": "D:\\GAL\\labels\\forward_15m.parquet",
+      "label_contract": "D:\\GAL\\contracts\\forward_15m.json"
+    },
+    {
+      "name": "30m",
+      "labels": "D:\\GAL\\labels\\forward_30m.parquet",
+      "label_contract": "D:\\GAL\\contracts\\forward_30m.json"
+    },
+    {
+      "name": "60m",
+      "labels": "D:\\GAL\\labels\\forward_60m.parquet",
+      "label_contract": "D:\\GAL\\contracts\\forward_60m.json"
+    },
+    {
+      "name": "120m",
+      "labels": "D:\\GAL\\labels\\forward_120m.parquet",
+      "label_contract": "D:\\GAL\\contracts\\forward_120m.json"
+    },
+    {
+      "name": "180m",
+      "labels": "D:\\GAL\\labels\\forward_180m.parquet",
+      "label_contract": "D:\\GAL\\contracts\\forward_180m.json"
+    }
+  ]
+}
