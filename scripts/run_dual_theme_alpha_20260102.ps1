@@ -10,6 +10,8 @@ param(
     [int]$Threads = 8,
     [string]$TempDirectory = "D:\GAL\duckdb_tmp",
     [int]$MinCrossSection = 100,
+    [int]$MinThemeSize = 5,
+    [int]$MinThemeCrossSection = 5,
     [switch]$AllowPartial,
     [switch]$ForceExport,
     [switch]$SkipCleanCheck
@@ -45,6 +47,7 @@ try {
         src/graphalphalab/dual_theme_common.py `
         src/graphalphalab/dual_theme_sql.py `
         src/graphalphalab/dual_theme_export.py `
+        src/graphalphalab/dual_theme_scope_alpha.py `
         src/graphalphalab/dual_theme_reporting.py `
         src/graphalphalab/dual_theme.py `
         src/graphalphalab/dual_theme_cli.py `
@@ -64,6 +67,8 @@ try {
         "--threads", $Threads,
         "--temp-directory", $TempDirectory,
         "--min-cross-section", $MinCrossSection,
+        "--min-theme-size", $MinThemeSize,
+        "--min-theme-cross-section", $MinThemeCrossSection,
         "--expected-git-commit", $head
     )
     if (-not $SkipCleanCheck) { $argsList += "--require-clean" }
@@ -83,13 +88,17 @@ try {
         (Join-Path $SignalsOutput "_SUCCESS"),
         (Join-Path $SignalsOutput "export_manifest.json"),
         (Join-Path $ReportOutput "_SUCCESS"),
+        (Join-Path $ReportOutput "global_alpha_metrics.csv"),
+        (Join-Path $ReportOutput "within_theme_alpha_metrics.csv"),
+        (Join-Path $ReportOutput "inter_theme_alpha_metrics.csv"),
+        (Join-Path $ReportOutput "cross_scope_comparison.csv"),
         (Join-Path $ReportOutput "scope_family_horizon_summary.csv"),
         (Join-Path $ReportOutput "matched_variant_comparison.csv"),
         (Join-Path $ReportOutput "ranking.csv")
     )) {
         if (-not (Test-Path $marker)) { throw "Missing governed output: $marker" }
     }
-    Write-Host "Dual-theme Alpha workflow complete."
+    Write-Host "Dual-theme scope-correct Alpha workflow complete."
     Write-Host "Signals: $SignalsOutput"
     Write-Host "Reports: $ReportOutput"
 }
