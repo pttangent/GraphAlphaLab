@@ -16,7 +16,11 @@ from .dual_theme_common import (
     load_horizon_manifest,
     parse_factor_id,
 )
-from .dual_theme_scope_alpha import evaluate_scope_alpha_streaming
+from .dual_theme_scope_alpha import (
+    SCOPE_ALPHA_SEMANTICS,
+    combine_alpha_results,
+    evaluate_dual_theme_scope_streaming,
+)
 from .governance import (
     ResourceBudget,
     atomic_write_frame,
@@ -54,30 +58,14 @@ def _annotate_result(
             parsed = frame["factor_id"].map(parse_factor_id).apply(pd.Series)
             for column in ("scope", "theme_family"):
                 frame[column] = parsed[column].values
+            if "scope_alpha_unit" not in frame.columns:
+                frame["scope_alpha_unit"] = parsed["scope"].map(
+                    {
+                        "global": "stock_global_cross_section",
+                        **SCOPE_ALPHA_SEMANTICS,
+                    }
+                ).fillna("unknown")
     return result
-
-
-def _combine_alpha_results(results: Iterable[AlphaResult]) -> AlphaResult:
-    rows = tuple(results)
-    fields = (
-        "metrics",
-        "ic_series",
-        "daily_ic",
-        "quantile_returns",
-        "portfolio_returns",
-        "stability",
-        "score_correlation",
-    )
-    payload: dict[str, pd.DataFrame] = {}
-    for field in fields:
-        frames = [getattr(row, field) for row in rows if not getattr(row, field).empty]
-        payload[field] = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    governance = {
-        "scope_governance": {
-            str(index): row.governance for index, row in enumerate(rows)
-        }
-    }
-    return AlphaResult(**payload, governance=governance)
 
 
 def _matched_variant_comparison(metrics: pd.DataFrame) -> pd.DataFrame:
@@ -92,7 +80,7 @@ def _matched_variant_comparison(metrics: pd.DataFrame) -> pd.DataFrame:
             "scale_minutes",
             "horizon",
             "horizon_minutes",
-            "alpha_semantics",
+            "scope_alpha_unit",
         )
         if column in metrics.columns
     ]
@@ -144,7 +132,7 @@ def _scope_summary(metrics: pd.DataFrame, matched: pd.DataFrame) -> pd.DataFrame
             "theme_family",
             "horizon",
             "horizon_minutes",
-            "alpha_semantics",
+            "scope_alpha_unit",
         )
         if column in metrics
     ]
@@ -209,61 +197,155 @@ def _scope_summary(metrics: pd.DataFrame, matched: pd.DataFrame) -> pd.DataFrame
 
 
 def _cross_scope_comparison(metrics: pd.DataFrame) -> pd.DataFrame:
-    if metrics.empty:
+    if metrics.empty or "scope" not in metrics.columns:
         return pd.DataFrame()
-    graph = metrics[metrics.get("variant_id") == "graph_forward"].copy()
-    if graph.empty:
-        return pd.DataFrame()
-    index = [
+    keys = [
         column
         for column in (
             "theme_family",
             "layer_id",
             "scale_minutes",
+            "variant_id",
             "horizon",
             "horizon_minutes",
         )
-        if column in graph.columns
+        if column in metrics.columns
     ]
-    values = [
+    value_columns = [
         column
-        for column in ("mean_spearman_ic", "net_mean_5bps")
-        if column in graph.columns
+        for column in ("mean_spearman_ic", "net_mean_5bps", "cost_survives_5bps")
+        if column in metrics.columns
     ]
-    if not index or not values or "scope" not in graph.columns:
+    if not keys or not value_columns:
         return pd.DataFrame()
-    pivot = graph.pivot_table(index=index, columns="scope", values=values, aggfunc="first")
+    pivot = metrics.pivot_table(
+        index=keys,
+        columns="scope",
+        values=value_columns,
+        aggfunc="first",
+    )
     pivot.columns = [f"{metric}__{scope}" for metric, scope in pivot.columns]
-    pivot = pivot.reset_index()
-    for metric in values:
-        global_column = f"{metric}__global"
-        for scope in ("within_theme", "inter_theme"):
-            scoped = f"{metric}__{scope}"
-            if scoped in pivot and global_column in pivot:
-                pivot[f"{metric}_increment__{scope}_vs_global"] = (
-                    pivot[scoped] - pivot[global_column]
-                )
-    return pivot
+    return pivot.reset_index()
 
 
-def _scope_expected_factors(export_manifest: dict[str, object]) -> dict[str, int]:
-    rows = export_manifest.get("output_files")
-    if not isinstance(rows, list):
-        return {}
-    keys: dict[str, set[tuple[str, str, int, str]]] = {}
-    for row in rows:
-        if not isinstance(row, dict) or int(row.get("rows", 0)) <= 0:
-            continue
-        scope = str(row.get("scope") or "")
-        keys.setdefault(scope, set()).add(
-            (
-                str(row.get("theme_family") or ""),
-                str(row.get("layer_id") or ""),
-                int(row.get("scale_minutes") or 0),
-                str(row.get("variant_id") or ""),
+def _scope_path(signals: Path, batch_id: str, scope: str) -> Path:
+    return signals / f"batch_id={batch_id}" / f"scope={scope}"
+
+
+def _run_governed_scope_alpha(
+    *,
+    signals: Path,
+    batch_id: str,
+    labels: Path,
+    contract: LabelContract,
+    metadata: pd.DataFrame | None,
+    metadata_signal_id: str,
+    metadata_id: str,
+    dimensions: list[str],
+    join_keys: list[str],
+    score_column: str,
+    symbol_column: str,
+    quantiles: int,
+    min_cross_section: int,
+    min_theme_size: int,
+    min_theme_cross_section: int,
+    direction_column: str | None,
+    default_direction: str,
+    control_columns: list[str],
+    annualization_factor: float | None,
+    resource_budget: ResourceBudget,
+    allow_legacy_signals: bool,
+    correlation_sample_modulus: int,
+) -> AlphaResult:
+    components: list[AlphaResult] = []
+    global_root = _scope_path(signals, batch_id, "global")
+    within_root = _scope_path(signals, batch_id, "within_theme")
+    inter_root = _scope_path(signals, batch_id, "inter_theme")
+    if global_root.exists():
+        global_result = evaluate_alpha_streaming(
+            global_root,
+            labels,
+            label_contract=contract,
+            join_keys=join_keys,
+            metadata=metadata,
+            metadata_signal_id=metadata_signal_id,
+            metadata_id=metadata_id,
+            slice_columns=dimensions,
+            score_column=score_column,
+            symbol_column=symbol_column,
+            quantiles=quantiles,
+            min_cross_section=min_cross_section,
+            direction_column=direction_column,
+            default_direction=default_direction,
+            control_columns=control_columns,
+            annualization_factor=annualization_factor,
+            resource_budget=resource_budget,
+            allow_legacy_signals=allow_legacy_signals,
+            correlation_sample_modulus=correlation_sample_modulus,
+        )
+        components.append(global_result)
+    if within_root.exists():
+        components.append(
+            evaluate_dual_theme_scope_streaming(
+                within_root,
+                labels,
+                scope="within_theme",
+                label_contract=contract,
+                join_keys=join_keys,
+                metadata=metadata,
+                metadata_signal_id=metadata_signal_id,
+                metadata_id=metadata_id,
+                slice_columns=dimensions,
+                score_column=score_column,
+                symbol_column=symbol_column,
+                quantiles=quantiles,
+                min_cross_section=min_cross_section,
+                min_theme_size=min_theme_size,
+                min_theme_cross_section=min_theme_cross_section,
+                direction_column=direction_column,
+                default_direction=default_direction,
+                control_columns=control_columns,
+                annualization_factor=annualization_factor,
+                resource_budget=resource_budget,
+                allow_legacy_signals=allow_legacy_signals,
             )
         )
-    return {scope: len(values) for scope, values in keys.items()}
+    if inter_root.exists():
+        components.append(
+            evaluate_dual_theme_scope_streaming(
+                inter_root,
+                labels,
+                scope="inter_theme",
+                label_contract=contract,
+                join_keys=join_keys,
+                score_column=score_column,
+                symbol_column=symbol_column,
+                quantiles=quantiles,
+                min_cross_section=min_cross_section,
+                min_theme_size=min_theme_size,
+                min_theme_cross_section=min_theme_cross_section,
+                direction_column=direction_column,
+                default_direction=default_direction,
+                control_columns=control_columns,
+                annualization_factor=annualization_factor,
+                resource_budget=resource_budget,
+                allow_legacy_signals=allow_legacy_signals,
+            )
+        )
+    if not components:
+        raise FileNotFoundError(
+            f"No governed Global/Within/Inter signal roots below {signals}"
+        )
+    return combine_alpha_results(
+        components,
+        governance={
+            "scope_alpha_contract": {
+                "global": "stock_global_cross_section",
+                **SCOPE_ALPHA_SEMANTICS,
+            },
+            "component_count": len(components),
+        },
+    )
 
 
 def run_dual_theme_alpha_campaign(
@@ -303,16 +385,23 @@ def run_dual_theme_alpha_campaign(
     if not success.exists() or not export_manifest_path.exists():
         raise FileNotFoundError(f"Dual-theme signals are incomplete: {signals}")
     export_manifest = json.loads(export_manifest_path.read_text(encoding="utf-8"))
-    export_version = str(export_manifest.get("export_version") or "")
-    if export_version != DUAL_THEME_EXPORT_VERSION and not allow_legacy_signals:
+    export_version = str(
+        export_manifest.get("export_version")
+        or export_manifest.get("parameters", {}).get("version")
+        or ""
+    )
+    governed_scope_semantics = export_version == DUAL_THEME_EXPORT_VERSION
+    if not governed_scope_semantics and not allow_legacy_signals:
         raise ValueError(
-            f"Dual-theme scope Alpha requires export_version={DUAL_THEME_EXPORT_VERSION}; "
-            f"observed={export_version!r}. Re-export signals instead of mixing semantics."
+            f"Dual-theme signals use export version {export_version!r}; "
+            f"expected {DUAL_THEME_EXPORT_VERSION!r}. Re-export before Alpha "
+            "evaluation, or use --allow-legacy-signals only for a diagnostic."
         )
     expected_factors = int(export_manifest.get("factor_count") or 0)
     if expected_factors <= 0:
         raise ValueError("Export manifest has no governed factors")
-    expected_by_scope = _scope_expected_factors(export_manifest)
+    parameters = export_manifest.get("parameters", {})
+    batch_id = str(parameters.get("batch_id") or DUAL_THEME_BATCH_ID)
     horizon_specs = load_horizon_manifest(horizon_manifest)
     join_key_list = list(join_keys)
     control_column_list = list(control_columns)
@@ -333,129 +422,82 @@ def run_dual_theme_alpha_campaign(
             dimensions=dimensions or None,
         )
         dimensions = list(metadata_profile.dimensions)
+    resolved_metadata_id = (
+        metadata_profile.id_column if metadata_profile else metadata_id
+    )
     all_metrics: list[pd.DataFrame] = []
-    all_scope_metrics: dict[str, list[pd.DataFrame]] = {
-        "global": [],
-        "within_theme": [],
-        "inter_theme": [],
-    }
     horizon_summaries: list[dict[str, object]] = []
     for spec in horizon_specs:
         contract = LabelContract.from_json(spec.label_contract)
-        global_result = evaluate_alpha_streaming(
-            signals,
-            spec.labels,
-            label_contract=contract,
-            join_keys=join_key_list,
-            metadata=metadata,
-            metadata_signal_id=metadata_signal_id,
-            metadata_id=(
-                metadata_profile.id_column if metadata_profile else metadata_id
-            ),
-            slice_columns=dimensions,
-            score_column=score_column,
-            symbol_column=symbol_column,
-            quantiles=quantiles,
-            min_cross_section=min_cross_section,
-            direction_column=direction_column,
-            default_direction=default_direction,
-            control_columns=control_column_list,
-            annualization_factor=annualization_factor,
-            resource_budget=resource_budget,
-            allow_legacy_signals=allow_legacy_signals,
-            correlation_sample_modulus=correlation_sample_modulus,
-            signal_filter="CAST(scope AS VARCHAR)='global'",
-        )
-        within_result = evaluate_scope_alpha_streaming(
-            signals,
-            spec.labels,
-            scope="within_theme",
-            label_contract=contract,
-            join_keys=join_key_list,
-            metadata=metadata,
-            metadata_signal_id=metadata_signal_id,
-            metadata_id=(
-                metadata_profile.id_column if metadata_profile else metadata_id
-            ),
-            slice_columns=dimensions,
-            score_column=score_column,
-            quantiles=quantiles,
-            min_cross_section=min_cross_section,
-            min_theme_size=min_theme_size,
-            min_theme_cross_section=min_theme_cross_section,
-            direction_column=direction_column,
-            default_direction=default_direction,
-            control_columns=control_column_list,
-            annualization_factor=annualization_factor,
-            resource_budget=resource_budget,
-            allow_legacy_signals=allow_legacy_signals,
-        )
-        inter_result = evaluate_scope_alpha_streaming(
-            signals,
-            spec.labels,
-            scope="inter_theme",
-            label_contract=contract,
-            join_keys=join_key_list,
-            score_column=score_column,
-            quantiles=quantiles,
-            min_cross_section=min_cross_section,
-            min_theme_size=min_theme_size,
-            min_theme_cross_section=min_theme_cross_section,
-            direction_column=direction_column,
-            default_direction=default_direction,
-            control_columns=control_column_list,
-            annualization_factor=annualization_factor,
-            resource_budget=resource_budget,
-            allow_legacy_signals=allow_legacy_signals,
-        )
-        global_result = _annotate_result(global_result, spec.name, contract)
-        within_result = _annotate_result(within_result, spec.name, contract)
-        inter_result = _annotate_result(inter_result, spec.name, contract)
-        for frame in (
-            global_result.metrics,
-            global_result.ic_series,
-            global_result.daily_ic,
-            global_result.quantile_returns,
-            global_result.portfolio_returns,
-            global_result.stability,
-        ):
-            if not frame.empty:
-                frame["alpha_semantics"] = "stock_cross_section"
-        result = _combine_alpha_results((global_result, within_result, inter_result))
-        observed_by_scope: dict[str, int] = {}
-        for scope, scope_result in (
-            ("global", global_result),
-            ("within_theme", within_result),
-            ("inter_theme", inter_result),
-        ):
-            identity_columns = [
-                column
-                for column in ("factor_id", "layer_id", "scale_minutes", "variant_id")
-                if column in scope_result.metrics.columns
-            ]
-            observed_by_scope[scope] = (
-                int(scope_result.metrics[identity_columns].drop_duplicates().shape[0])
-                if identity_columns and not scope_result.metrics.empty
-                else 0
+        if governed_scope_semantics:
+            result = _run_governed_scope_alpha(
+                signals=signals,
+                batch_id=batch_id,
+                labels=spec.labels,
+                contract=contract,
+                metadata=metadata,
+                metadata_signal_id=metadata_signal_id,
+                metadata_id=resolved_metadata_id,
+                dimensions=dimensions,
+                join_keys=join_key_list,
+                score_column=score_column,
+                symbol_column=symbol_column,
+                quantiles=quantiles,
+                min_cross_section=min_cross_section,
+                min_theme_size=min_theme_size,
+                min_theme_cross_section=min_theme_cross_section,
+                direction_column=direction_column,
+                default_direction=default_direction,
+                control_columns=control_column_list,
+                annualization_factor=annualization_factor,
+                resource_budget=resource_budget,
+                allow_legacy_signals=allow_legacy_signals,
+                correlation_sample_modulus=correlation_sample_modulus,
             )
-            if not scope_result.metrics.empty:
-                all_scope_metrics[scope].append(scope_result.metrics.copy())
-        observed = sum(observed_by_scope.values())
-        complete = all(
-            observed_by_scope.get(scope, 0) == expected
-            for scope, expected in expected_by_scope.items()
-        ) and observed == expected_factors
+        else:
+            result = evaluate_alpha_streaming(
+                signals,
+                spec.labels,
+                label_contract=contract,
+                join_keys=join_key_list,
+                metadata=metadata,
+                metadata_signal_id=metadata_signal_id,
+                metadata_id=resolved_metadata_id,
+                slice_columns=dimensions,
+                score_column=score_column,
+                symbol_column=symbol_column,
+                quantiles=quantiles,
+                min_cross_section=min_cross_section,
+                direction_column=direction_column,
+                default_direction=default_direction,
+                control_columns=control_column_list,
+                annualization_factor=annualization_factor,
+                resource_budget=resource_budget,
+                allow_legacy_signals=True,
+                correlation_sample_modulus=correlation_sample_modulus,
+            )
+        result = _annotate_result(result, spec.name, contract)
+        identity_columns = [
+            column
+            for column in ("factor_id", "layer_id", "scale_minutes", "variant_id")
+            if column in result.metrics.columns
+        ]
+        observed = (
+            int(result.metrics[identity_columns].drop_duplicates().shape[0])
+            if identity_columns and not result.metrics.empty
+            else 0
+        )
+        complete = observed == expected_factors
         if not complete and not allow_partial:
             raise ValueError(
-                f"Horizon {spec.name} expected {expected_factors} factors {expected_by_scope}, "
-                f"observed {observed} {observed_by_scope}; use --allow-partial only for an explicit diagnostic"
+                f"Horizon {spec.name} expected {expected_factors} factors, "
+                f"observed {observed}; use --allow-partial only for an explicit "
+                "diagnostic"
             )
         batch_status = {
             "batch_id": DUAL_THEME_BATCH_ID,
             "expected_contracts": expected_factors,
             "observed_contracts": observed,
-            "expected_by_scope": expected_by_scope,
-            "observed_by_scope": observed_by_scope,
             "complete": complete,
             "partial": not complete,
             "report_scope": list(get_batch(DUAL_THEME_BATCH_ID).report_scope),
@@ -476,7 +518,7 @@ def run_dual_theme_alpha_campaign(
         if metadata_file is not None:
             manifest_inputs.append(file_record(metadata_file))
         run_manifest = implementation_manifest(
-            operation="dual_theme_scope_alpha_report",
+            operation="dual_theme_alpha_report",
             parameters={
                 "version": DUAL_THEME_ALPHA_VERSION,
                 "horizon": spec.name,
@@ -484,14 +526,12 @@ def run_dual_theme_alpha_campaign(
                 "join_keys": join_key_list,
                 "control_columns": control_column_list,
                 "expected_factors": expected_factors,
-                "expected_by_scope": expected_by_scope,
-                "min_theme_size": min_theme_size,
-                "min_theme_cross_section": min_theme_cross_section,
-                "scope_semantics": {
-                    "global": "stock_cross_section",
-                    "within_theme": "stock_within_theme_neutral",
-                    "inter_theme": "theme_portfolio_weighted_member_return",
+                "scope_alpha_contract": {
+                    "global": "stock_global_cross_section",
+                    **SCOPE_ALPHA_SEMANTICS,
                 },
+                "min_theme_size": int(min_theme_size),
+                "min_theme_cross_section": int(min_theme_cross_section),
             },
             inputs=manifest_inputs,
             resource_budget=resource_budget,
@@ -519,8 +559,6 @@ def run_dual_theme_alpha_campaign(
                 "report": str(horizon_output),
                 "observed_factors": observed,
                 "expected_factors": expected_factors,
-                "observed_by_scope": observed_by_scope,
-                "expected_by_scope": expected_by_scope,
                 "complete": complete,
             }
         )
@@ -531,12 +569,16 @@ def run_dual_theme_alpha_campaign(
     scope_summary = _scope_summary(combined, matched)
     cross_scope = _cross_scope_comparison(combined)
     atomic_write_frame(combined, output / "all_horizons_alpha_metrics.csv")
-    for scope, frames in all_scope_metrics.items():
-        frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-        atomic_write_frame(frame, output / f"{scope}_alpha_metrics.csv")
     atomic_write_frame(matched, output / "matched_variant_comparison.csv")
     atomic_write_frame(scope_summary, output / "scope_family_horizon_summary.csv")
     atomic_write_frame(cross_scope, output / "cross_scope_comparison.csv")
+    for scope in ("global", "within_theme", "inter_theme"):
+        scoped = (
+            combined[combined["scope"] == scope].copy()
+            if "scope" in combined.columns
+            else pd.DataFrame()
+        )
+        atomic_write_frame(scoped, output / f"{scope}_alpha_metrics.csv")
     ranking = matched.copy()
     ranking_columns = [
         column
@@ -562,44 +604,55 @@ def run_dual_theme_alpha_campaign(
         "version": DUAL_THEME_ALPHA_VERSION,
         "batch_id": DUAL_THEME_BATCH_ID,
         "signals_root": str(signals),
-        "export_manifest_sha256": sha256_file(export_manifest_path),
         "export_version": export_version,
         "gff_campaign_version": export_manifest.get("gff_campaign_version"),
+        "export_manifest_sha256": sha256_file(export_manifest_path),
         "expected_factor_count_per_horizon": expected_factors,
-        "expected_by_scope": expected_by_scope,
         "horizons": horizon_summaries,
         "metric_rows": int(len(combined)),
         "matched_rows": int(len(matched)),
         "scope_summary_rows": int(len(scope_summary)),
         "cross_scope_rows": int(len(cross_scope)),
-        "complete": complete_all,
-        "scope_semantics": {
-            "global": "stock_cross_section",
-            "within_theme": "theme_mean_return_removed_and_score_residualized_inside_theme",
-            "inter_theme": "membership_weighted_theme_portfolio_return_ranked_across_themes",
+        "scope_alpha_contract": {
+            "global": "stock_global_cross_section",
+            **SCOPE_ALPHA_SEMANTICS,
         },
-        "cost_boundary": (
-            "Inter-theme costs are theme-notional diagnostics. Production implementation must add constituent execution and membership migration costs."
-        ),
+        "complete": complete_all,
         "one_day_inference_warning": (
-            "One-session results are diagnostic and cannot satisfy the >=20-date governance gate."
+            "One-session results are diagnostic and cannot satisfy the >=20-date "
+            "governance gate."
+        ),
+        "inter_theme_cost_warning": (
+            "Inter-Theme turnover and transaction costs are measured at the "
+            "theme-portfolio notional level. Constituent migration costs require "
+            "a separate execution overlay before promotion."
         ),
     }
     atomic_write_json(output / "summary.json", summary)
     lines = [
-        "# GraphAlphaLab dual-theme, scope-correct multi-horizon Alpha report",
+        "# GraphAlphaLab dual-theme multi-horizon Alpha report",
         "",
         f"- Signals: `{signals}`",
+        f"- Export contract: `{export_version}`",
+        f"- GFF campaign version: `{export_manifest.get('gff_campaign_version')}`",
         f"- Expected factor identities per horizon: {expected_factors}",
         f"- Horizons: {', '.join(spec.name for spec in horizon_specs)}",
         "- Identity: `theme_family × scope × layer × scale × variant × horizon`",
-        "- Global: ordinary stock cross-sectional Alpha.",
-        "- Within-theme: stock score is neutralized inside each PIT theme; the theme mean forward return is removed before IC and portfolio evaluation.",
-        "- Inter-theme: stock labels are aggregated into membership-weighted theme portfolio returns; ranking occurs across themes, never across duplicated member-stock scores.",
-        "- Reverse-edge placebo and node baseline remain matched inside each scope.",
-        "- Inter-theme transaction costs are diagnostic theme-notional costs, not a constituent execution backtest.",
+        "- Global Alpha: stock-level market-wide cross-section.",
+        "- Within-Theme Alpha: graph score is ranked/residualized inside each "
+        "canonical theme and tested against theme-demeaned forward stock returns.",
+        "- Inter-Theme Alpha: one signal per theme is tested against the "
+        "membership-weighted forward return of that theme portfolio.",
+        "- Inter-Theme costs are theme-notional diagnostics; constituent migration "
+        "and basket execution costs remain a required promotion overlay.",
         "",
-        "Key files: `global_alpha_metrics.csv`, `within_theme_alpha_metrics.csv`, `inter_theme_alpha_metrics.csv`, `cross_scope_comparison.csv`, `scope_family_horizon_summary.csv`, `matched_variant_comparison.csv`, `ranking.csv`.",
+        "One-day output is a mechanism and runtime comparison, not statistical "
+        "promotion evidence.",
+        "",
+        "Key files: `within_theme_alpha_metrics.csv`, "
+        "`inter_theme_alpha_metrics.csv`, `cross_scope_comparison.csv`, "
+        "`scope_family_horizon_summary.csv`, `matched_variant_comparison.csv`, "
+        "`ranking.csv`.",
     ]
     atomic_write_text(output / "REPORT.md", "\n".join(lines) + "\n")
     marker = output / ("_SUCCESS" if complete_all else "_PARTIAL")
