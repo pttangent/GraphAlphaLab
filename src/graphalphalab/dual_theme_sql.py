@@ -104,11 +104,11 @@ def _stock_query(
           FROM read_parquet('{membership_path}', union_by_name=true)
         )
         """
-        membership_join = f"""
+        membership_join = """
         JOIN memberships membership
           ON CAST(e.trade_date AS VARCHAR)=membership.trade_date
          AND e.decision_time=membership.decision_time
-         AND {{selected_id}}=membership.symbol_id
+         AND {selected_id}=membership.symbol_id
         """
         context_theme = "membership.theme_id"
         membership_weight = "membership.membership_weight"
@@ -183,6 +183,14 @@ def _stock_query(
         own = "any_value(src.node_score)"
         valid = "dst.node_score IS NOT NULL"
     scoped_join = membership_join.format(selected_id=selected_id)
+    # A scoped signal cannot be available before the P1 theme membership used to
+    # define its scope. Global signals retain the actual edge-availability time;
+    # Within-Theme signals become available at the governed theme decision time.
+    signal_available = (
+        "e.decision_time"
+        if partition.scope == "within_theme"
+        else "max(e.edge_available_time)"
+    )
     return f"""
     WITH edges AS (
       SELECT * FROM read_parquet('{edges_path}', union_by_name=true)
@@ -205,7 +213,7 @@ def _stock_query(
       count(*)::BIGINT AS edge_count,
       {context_theme} AS context_theme_id,
       {membership_weight} AS membership_weight,
-      max(e.edge_available_time) AS signal_available_time
+      {signal_available} AS signal_available_time
     FROM edges e
     JOIN nodes src
       ON e.decision_time=src.decision_time
@@ -287,7 +295,7 @@ def _inter_query(
           {score} AS score,
           {own} AS own_score,
           count(*)::BIGINT AS edge_count,
-          max(e.edge_available_time) AS signal_available_time
+          e.decision_time AS signal_available_time
         FROM edges e
         JOIN nodes src
           ON e.decision_time=src.decision_time
