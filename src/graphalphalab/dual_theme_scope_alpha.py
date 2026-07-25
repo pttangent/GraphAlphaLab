@@ -53,23 +53,35 @@ def _refresh_governance(metrics: pd.DataFrame, *, pit_passed: bool) -> pd.DataFr
     if metrics.empty:
         return metrics
     metrics = metrics.copy()
+    defaults: dict[str, object] = {
+        "spearman_ic_pvalue_daily": np.nan,
+        "direction_predeclared": False,
+        "annualization_valid": False,
+        "sample_sufficient": False,
+        "cost_survives_5bps": False,
+        "direction_consistent": False,
+        "mean_spearman_ic": np.nan,
+    }
+    for column, default in defaults.items():
+        if column not in metrics.columns:
+            metrics[column] = default
     metrics["fdr_qvalue"], metrics["fdr_pass"] = _bh_fdr(
         metrics["spearman_ic_pvalue_daily"]
     )
     metrics["governance_ready"] = (
-        metrics["direction_predeclared"].fillna(False)
-        & metrics["annualization_valid"].fillna(False)
+        metrics["direction_predeclared"].fillna(False).astype(bool)
+        & metrics["annualization_valid"].fillna(False).astype(bool)
         & bool(pit_passed)
     )
     metrics["research_status"] = np.select(
         [
-            metrics["sample_sufficient"]
-            & metrics["fdr_pass"]
-            & metrics["cost_survives_5bps"]
-            & metrics["direction_consistent"]
-            & metrics["governance_ready"],
-            metrics["sample_sufficient"]
-            & (metrics["mean_spearman_ic"].abs() >= 0.01),
+            metrics["sample_sufficient"].fillna(False).astype(bool)
+            & metrics["fdr_pass"].fillna(False).astype(bool)
+            & metrics["cost_survives_5bps"].fillna(False).astype(bool)
+            & metrics["direction_consistent"].fillna(False).astype(bool)
+            & metrics["governance_ready"].fillna(False).astype(bool),
+            metrics["sample_sufficient"].fillna(False).astype(bool)
+            & (pd.to_numeric(metrics["mean_spearman_ic"], errors="coerce").abs() >= 0.01),
         ],
         ["candidate", "needs_falsification"],
         default="insufficient_or_rejected",
@@ -124,18 +136,21 @@ def _rank_residualize(
         sort=False,
         dropna=False,
     ):
-        values = group[[score_column, *control_columns]].apply(
+        selected_columns = list(dict.fromkeys([score_column, *control_columns]))
+        values = group[selected_columns].apply(
             pd.to_numeric,
             errors="coerce",
         )
         valid = values.dropna(subset=[score_column])
-        if len(valid) < min_group_size:
+        if len(valid) < int(min_group_size):
             continue
         y = valid[score_column].rank(method="average", pct=True).to_numpy(float)
         columns = [np.ones(len(valid))]
         for control in control_columns:
+            if control == score_column or control not in valid.columns:
+                continue
             series = valid[control]
-            if series.notna().sum() < min_group_size or series.nunique(dropna=True) < 2:
+            if series.notna().sum() < int(min_group_size) or series.nunique(dropna=True) < 2:
                 continue
             ranked = series.rank(method="average", pct=True)
             ranked = ranked.fillna(ranked.mean())
@@ -160,6 +175,8 @@ def _prepare_within_factor(
         )
     data = factor.copy()
     data["context_theme_id"] = data["context_theme_id"].astype("string")
+    data[score_column] = pd.to_numeric(data[score_column], errors="coerce")
+    data["target_return"] = pd.to_numeric(data["target_return"], errors="coerce")
     data = data.dropna(subset=["context_theme_id", score_column, "target_return"])
     group_columns = ["decision_time", "context_theme_id"]
     group_size = data.groupby(group_columns, observed=True)[score_column].transform(
@@ -178,9 +195,7 @@ def _prepare_within_factor(
         control_columns=selected_controls,
         min_group_size=int(min_theme_size),
     )
-    target = pd.to_numeric(data["target_return"], errors="coerce")
-    data["target_return"] = target
-    data["scope_target_return"] = target - data.groupby(
+    data["scope_target_return"] = data["target_return"] - data.groupby(
         group_columns,
         observed=True,
     )["target_return"].transform("mean")
@@ -217,6 +232,8 @@ def _prepare_inter_factor(
         )
     data = factor.copy()
     data["context_theme_id"] = data["context_theme_id"].astype("string")
+    data[score_column] = pd.to_numeric(data[score_column], errors="coerce")
+    data["target_return"] = pd.to_numeric(data["target_return"], errors="coerce")
     data = data.dropna(subset=["context_theme_id", score_column, "target_return"])
     if data.empty:
         return data
@@ -273,11 +290,10 @@ def _prepare_inter_factor(
                         "Inter-Theme rows contain conflicting expected_direction "
                         f"inside context_theme_id={row.get('context_theme_id')!r}"
                     )
-                row[column] = (
-                    non_null.max()
-                    if column == "signal_available_time" and not non_null.empty
-                    else non_null.iloc[0] if not non_null.empty else None
-                )
+                if column == "signal_available_time":
+                    row[column] = non_null.max() if not non_null.empty else None
+                else:
+                    row[column] = non_null.iloc[0] if not non_null.empty else None
         score_values = pd.to_numeric(group[score_column], errors="coerce").dropna()
         row["broadcast_score_spread"] = (
             float(score_values.max() - score_values.min())
@@ -299,7 +315,7 @@ def _prepare_inter_factor(
     if bool((spread.abs() > 1e-12).any()):
         raise ValueError(
             "Inter-Theme broadcast produced non-identical stock scores inside "
-            "the same context_theme_id; refusing ambiguous theme aggregation."
+            "the same context_theme_id; refusing arbitrary stock tie-breaking."
         )
     selected_controls = [
         column for column in control_columns if column in themes.columns
@@ -317,6 +333,66 @@ def _prepare_inter_factor(
     )
     themes["scope_alpha_unit"] = SCOPE_ALPHA_SEMANTICS["inter_theme"]
     return themes.dropna(subset=["scope_score", "scope_target_return"])
+
+
+def _insufficient_factor_result(
+    factor_row: pd.Series,
+    *,
+    factor_keys: list[str],
+    scope: str,
+    pit_audit: dict[str, object],
+    label_contract: LabelContract,
+    reason: str,
+    input_rows: int,
+    evaluable_rows: int,
+    symbol_count: int,
+) -> AlphaResult:
+    identity = {
+        key: factor_row[key]
+        for key in factor_keys
+        if key in factor_row.index
+    }
+    metric = {
+        **identity,
+        "observations": int(input_rows),
+        "decision_count": 0,
+        "date_count": 0,
+        "symbol_count": int(symbol_count),
+        "mean_spearman_ic": np.nan,
+        "spearman_ic_pvalue_daily": np.nan,
+        "net_mean_5bps": np.nan,
+        "direction_predeclared": False,
+        "annualization_valid": False,
+        "sample_sufficient": False,
+        "cost_survives_5bps": False,
+        "direction_consistent": False,
+        "governance_ready": False,
+        "research_status": "insufficient_or_rejected",
+        "scope": scope,
+        "scope_alpha_unit": SCOPE_ALPHA_SEMANTICS[scope],
+        "scope_drop_reason": reason,
+        "scope_input_rows": int(input_rows),
+        "scope_evaluable_rows": int(evaluable_rows),
+        "inter_theme_cost_semantics": (
+            "theme_portfolio_notional" if scope == "inter_theme" else "stock_turnover"
+        ),
+    }
+    return AlphaResult(
+        metrics=pd.DataFrame([metric]),
+        ic_series=pd.DataFrame(),
+        daily_ic=pd.DataFrame(),
+        quantile_returns=pd.DataFrame(),
+        portfolio_returns=pd.DataFrame(),
+        stability=pd.DataFrame(),
+        score_correlation=pd.DataFrame(),
+        governance={
+            "pit_audit": pit_audit,
+            "label_contract": label_contract.as_dict(),
+            "scope": scope,
+            "scope_semantics": SCOPE_ALPHA_SEMANTICS[scope],
+            "scope_drop_reason": reason,
+        },
+    )
 
 
 def evaluate_dual_theme_scope_streaming(
@@ -349,175 +425,220 @@ def evaluate_dual_theme_scope_streaming(
     keys_join = list(join_keys)
     controls = list(control_columns)
     connection = duckdb.connect()
-    configure_duckdb(connection, resource_budget)
-    connection.execute(
-        f"CREATE VIEW signals AS SELECT * FROM {_table_expression(signals_path)}"
-    )
-    connection.execute(
-        f"CREATE VIEW labels AS SELECT * FROM {_table_expression(labels_path)}"
-    )
-    pit_audit = _audit_pit(
-        connection,
-        label_contract,
-        join_keys=keys_join,
-        allow_legacy_signals=allow_legacy_signals,
-    )
-    signal_columns = _columns(connection, "signals")
-    required_signal = {"context_theme_id", "membership_weight"}
-    missing_scope = sorted(required_signal - signal_columns)
-    if missing_scope:
-        raise ValueError(
-            f"{scope} signals are missing scope semantics columns: {missing_scope}. "
-            "Re-export the GFF campaign with the V2 GAL exporter."
+    try:
+        configure_duckdb(connection, resource_budget)
+        connection.execute(
+            f"CREATE VIEW signals AS SELECT * FROM {_table_expression(signals_path)}"
         )
-    factor_keys, factors = _factor_keys(connection)
-    if factors.empty:
-        return _empty_result(
-            {
-                "pit_audit": pit_audit.as_dict(),
-                "scope": scope,
-                "scope_semantics": SCOPE_ALPHA_SEMANTICS[scope],
-            }
+        connection.execute(
+            f"CREATE VIEW labels AS SELECT * FROM {_table_expression(labels_path)}"
         )
-    select_signal = [
-        *factor_keys,
-        *keys_join,
-        symbol_column,
-        score_column,
-        "context_theme_id",
-        "membership_weight",
-        *[
-            column
-            for column in (
-                "signal_available_time",
-                direction_column,
-                *controls,
+        pit_audit = _audit_pit(
+            connection,
+            label_contract,
+            join_keys=keys_join,
+            allow_legacy_signals=allow_legacy_signals,
+        )
+        signal_columns = _columns(connection, "signals")
+        label_columns = _columns(connection, "labels")
+        required_signal = {"context_theme_id", "membership_weight", *keys_join}
+        missing_scope = sorted(required_signal - signal_columns)
+        missing_labels = sorted(set(keys_join) - label_columns)
+        if missing_scope or missing_labels:
+            raise ValueError(
+                f"{scope} scope contract columns missing; "
+                f"signal_missing={missing_scope}, label_missing={missing_labels}. "
+                "Re-export the GFF campaign with the V2 GAL exporter."
             )
-            if column and column in signal_columns
-        ],
-    ]
-    select_signal = list(dict.fromkeys(select_signal))
-    join_expression = " AND ".join(
-        f's."{key}"=l."{key}"' for key in keys_join
-    )
-    label_filter = (
-        f"CAST(l.label_id AS VARCHAR)={_sql_literal(label_contract.label_id)}"
-    )
-    results: list[AlphaResult] = []
-    for _, factor_row in factors.iterrows():
-        where = _factor_where(factor_keys, factor_row)
-        signal_projection = ", ".join(
-            f's."{column}"' for column in select_signal
-        )
-        query = f"""
-        SELECT {signal_projection},
-               l."{label_contract.target_column}" AS target_return,
-               l.label_id,
-               l."{label_contract.entry_time_column}" AS entry_time,
-               l."{label_contract.exit_time_column}" AS exit_time,
-               l."{label_contract.available_time_column}" AS label_available_time
-        FROM signals s
-        JOIN labels l ON {join_expression}
-        WHERE {where} AND {label_filter}
-        ORDER BY s.trade_date, s.decision_time, s."{symbol_column}"
-        """
-        factor = connection.execute(query).fetch_df()
-        if factor.empty:
-            continue
-        if scope == "within_theme":
-            if metadata is not None:
-                factor = factor.merge(
-                    metadata,
-                    left_on=metadata_signal_id,
-                    right_on=metadata_id,
-                    how="left",
-                    validate="many_to_one",
+        factor_keys, factors = _factor_keys(connection)
+        if factors.empty:
+            return _empty_result(
+                {
+                    "pit_audit": pit_audit.as_dict(),
+                    "scope": scope,
+                    "scope_semantics": SCOPE_ALPHA_SEMANTICS[scope],
+                }
+            )
+        select_signal = [
+            *factor_keys,
+            *keys_join,
+            symbol_column,
+            score_column,
+            "context_theme_id",
+            "membership_weight",
+            *[
+                column
+                for column in (
+                    "signal_available_time",
+                    direction_column,
+                    *controls,
                 )
-            prepared = _prepare_within_factor(
-                factor,
-                score_column=score_column,
-                control_columns=controls,
-                min_theme_size=min_theme_size,
+                if column and column in signal_columns
+            ],
+        ]
+        select_signal = list(dict.fromkeys(select_signal))
+        join_expression = " AND ".join(
+            f's."{key}"=l."{key}"' for key in keys_join
+        )
+        label_filter = (
+            f"CAST(l.label_id AS VARCHAR)={_sql_literal(label_contract.label_id)}"
+        )
+        results: list[AlphaResult] = []
+        for _, factor_row in factors.iterrows():
+            where = _factor_where(factor_keys, factor_row)
+            signal_projection = ", ".join(
+                f's."{column}"' for column in select_signal
             )
-            scope_min_cross_section = int(min_cross_section)
-            scope_symbol_column = symbol_column
-            scope_slices = list(slice_columns)
-        else:
-            prepared = _prepare_inter_factor(
-                factor,
-                score_column=score_column,
-                control_columns=controls,
-                min_theme_cross_section=min_theme_cross_section,
-                min_theme_size=min_theme_size,
+            query = f"""
+            SELECT {signal_projection},
+                   l."{label_contract.target_column}" AS target_return,
+                   l.label_id,
+                   l."{label_contract.entry_time_column}" AS entry_time,
+                   l."{label_contract.exit_time_column}" AS exit_time,
+                   l."{label_contract.available_time_column}" AS label_available_time
+            FROM signals s
+            JOIN labels l ON {join_expression}
+            WHERE {where} AND {label_filter}
+            ORDER BY s.trade_date, s.decision_time, s."{symbol_column}"
+            """
+            factor = connection.execute(query).fetch_df()
+            input_rows = int(len(factor))
+            symbol_count = (
+                int(factor[symbol_column].nunique())
+                if symbol_column in factor.columns and not factor.empty
+                else 0
             )
-            scope_min_cross_section = int(min_theme_cross_section)
-            scope_symbol_column = "symbol_id"
-            scope_slices = []
-        if prepared.empty:
-            continue
-        result = evaluate_alpha(
-            prepared,
-            score_column="scope_score",
-            label_column="scope_target_return",
-            time_column="decision_time",
-            symbol_column=scope_symbol_column,
-            trade_date_column="trade_date",
-            quantiles=quantiles,
-            annualization_factor=annualization_factor,
-            min_cross_section=scope_min_cross_section,
-            slice_columns=scope_slices,
-            direction_column=direction_column,
-            default_direction=default_direction,
-            control_columns=(),
-            label_overlapping=label_contract.overlapping,
+            if factor.empty:
+                results.append(
+                    _insufficient_factor_result(
+                        factor_row,
+                        factor_keys=factor_keys,
+                        scope=scope,
+                        pit_audit=pit_audit.as_dict(),
+                        label_contract=label_contract,
+                        reason="no_label_overlap",
+                        input_rows=0,
+                        evaluable_rows=0,
+                        symbol_count=0,
+                    )
+                )
+                continue
+            if scope == "within_theme":
+                if metadata is not None:
+                    if metadata_signal_id not in factor.columns or metadata_id not in metadata.columns:
+                        raise ValueError(
+                            "Metadata join columns missing: "
+                            f"signals={metadata_signal_id!r}, metadata={metadata_id!r}"
+                        )
+                    factor = factor.merge(
+                        metadata,
+                        left_on=metadata_signal_id,
+                        right_on=metadata_id,
+                        how="left",
+                        validate="many_to_one",
+                    )
+                prepared = _prepare_within_factor(
+                    factor,
+                    score_column=score_column,
+                    control_columns=controls,
+                    min_theme_size=min_theme_size,
+                )
+                scope_min_cross_section = int(min_cross_section)
+                scope_symbol_column = symbol_column
+                scope_slices = list(slice_columns)
+            else:
+                prepared = _prepare_inter_factor(
+                    factor,
+                    score_column=score_column,
+                    control_columns=controls,
+                    min_theme_cross_section=min_theme_cross_section,
+                    min_theme_size=min_theme_size,
+                )
+                scope_min_cross_section = int(min_theme_cross_section)
+                scope_symbol_column = "symbol_id"
+                scope_slices = []
+            evaluable_rows = int(len(prepared))
+            if prepared.empty:
+                results.append(
+                    _insufficient_factor_result(
+                        factor_row,
+                        factor_keys=factor_keys,
+                        scope=scope,
+                        pit_audit=pit_audit.as_dict(),
+                        label_contract=label_contract,
+                        reason=(
+                            "insufficient_within_theme_members"
+                            if scope == "within_theme"
+                            else "insufficient_inter_theme_cross_section"
+                        ),
+                        input_rows=input_rows,
+                        evaluable_rows=0,
+                        symbol_count=symbol_count,
+                    )
+                )
+                del factor, prepared
+                gc.collect()
+                continue
+            result = evaluate_alpha(
+                prepared,
+                score_column="scope_score",
+                label_column="scope_target_return",
+                time_column="decision_time",
+                symbol_column=scope_symbol_column,
+                trade_date_column="trade_date",
+                quantiles=quantiles,
+                annualization_factor=annualization_factor,
+                min_cross_section=scope_min_cross_section,
+                slice_columns=scope_slices,
+                direction_column=direction_column,
+                default_direction=default_direction,
+                control_columns=(),
+                label_overlapping=label_contract.overlapping,
+                governance={
+                    "pit_audit": pit_audit.as_dict(),
+                    "label_contract": label_contract.as_dict(),
+                    "scope": scope,
+                    "scope_semantics": SCOPE_ALPHA_SEMANTICS[scope],
+                },
+            )
+            for frame in (
+                result.metrics,
+                result.ic_series,
+                result.daily_ic,
+                result.quantile_returns,
+                result.portfolio_returns,
+                result.stability,
+            ):
+                if not frame.empty:
+                    frame["scope_alpha_unit"] = SCOPE_ALPHA_SEMANTICS[scope]
+            if not result.metrics.empty:
+                result.metrics["scope"] = scope
+                result.metrics["scope_input_rows"] = input_rows
+                result.metrics["scope_evaluable_rows"] = evaluable_rows
+                result.metrics["scope_drop_reason"] = None
+                result.metrics["inter_theme_cost_semantics"] = (
+                    "theme_portfolio_notional"
+                    if scope == "inter_theme"
+                    else "stock_turnover"
+                )
+            results.append(result)
+            del factor, prepared, result
+            gc.collect()
+        combined = combine_alpha_results(
+            results,
             governance={
                 "pit_audit": pit_audit.as_dict(),
                 "label_contract": label_contract.as_dict(),
                 "scope": scope,
                 "scope_semantics": SCOPE_ALPHA_SEMANTICS[scope],
+                "factor_count": int(len(factors)),
+                "streaming_mode": "factor_sequential_duckdb_scope_aware",
+                "resource_budget": resource_budget.as_dict(),
             },
         )
-        for frame in (
-            result.metrics,
-            result.ic_series,
-            result.daily_ic,
-            result.quantile_returns,
-            result.portfolio_returns,
-            result.stability,
-        ):
-            if not frame.empty:
-                frame["scope_alpha_unit"] = SCOPE_ALPHA_SEMANTICS[scope]
-        if not result.metrics.empty:
-            result.metrics["scope"] = scope
-            result.metrics["inter_theme_cost_semantics"] = (
-                "theme_portfolio_notional"
-                if scope == "inter_theme"
-                else "stock_turnover"
-            )
-        results.append(result)
-        del factor, prepared, result
-        gc.collect()
-    if not results:
-        return _empty_result(
-            {
-                "pit_audit": pit_audit.as_dict(),
-                "scope": scope,
-                "scope_semantics": SCOPE_ALPHA_SEMANTICS[scope],
-            }
-        )
-    combined = combine_alpha_results(
-        results,
-        governance={
-            "pit_audit": pit_audit.as_dict(),
-            "label_contract": label_contract.as_dict(),
-            "scope": scope,
-            "scope_semantics": SCOPE_ALPHA_SEMANTICS[scope],
-            "factor_count": int(len(factors)),
-            "streaming_mode": "factor_sequential_duckdb_scope_aware",
-            "resource_budget": resource_budget.as_dict(),
-        },
-    )
-    return combined
+        return combined
+    finally:
+        connection.close()
 
 
 prepare_within_theme_factor = _prepare_within_factor
