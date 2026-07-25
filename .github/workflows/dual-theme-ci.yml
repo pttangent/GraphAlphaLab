@@ -38,7 +38,10 @@ jobs:
           set +e
           python -m pytest -q --tb=line > pytest.log 2>&1
           status=$?
-          summary=$(tail -n 1 pytest.log | tr -cd '[:alnum:] _.,:=/-' | cut -c1-180)
+          summary=$(grep -E '^(FAILED|ERROR) ' pytest.log | head -n 1 | tr -cd '[:alnum:] _.,:=/\[\]-' | cut -c1-220)
+          if [ -z "$summary" ]; then
+            summary=$(tail -n 1 pytest.log | tr -cd '[:alnum:] _.,:=/-' | cut -c1-220)
+          fi
           echo "pytest_summary=$summary" >> "$GITHUB_OUTPUT"
           cat pytest.log
           exit $status
