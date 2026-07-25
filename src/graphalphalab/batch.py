@@ -40,6 +40,24 @@ BATCH_REGISTRY: dict[str, BatchSpec] = {
         "theme_discovery", 1, 10, ("theme_purity", "structure", "optional_alpha"),
         description="Legacy alias for a single consensus membership export. Prefer similarity10 P1 reporting.",
     ),
+    "dual_theme_igc": BatchSpec(
+        "dual_theme_igc",
+        None,
+        106,
+        (
+            "alpha",
+            "performance",
+            "robustness",
+            "cross_scope",
+            "cross_theme_family",
+            "multi_horizon",
+        ),
+        description=(
+            "Momentum and residual-return Theme families with shared Global IGC and "
+            "family-specific Within/Inter IGC contracts. Expected factor count is derived "
+            "from the governed export manifest because every contract has three variants."
+        ),
+    ),
     "all41": BatchSpec(
         "all41", 41, 41, ("alpha", "performance", "robustness", "cross_batch"),
         parents=("implemented27", "remaining14"),

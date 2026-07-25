@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "graph-alpha-lab"
-version = "0.3.0"
-description = "Governed, OOM-bounded graph-signal, P1 structure/temporal/purity and Alpha campaign reporting layer for GraphFactorFactory outputs"
+version = "0.4.0"
+description = "Governed, OOM-bounded graph-signal, dual-theme multi-scope Alpha and campaign reporting layer for GraphFactorFactory outputs"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -25,6 +25,7 @@ test = ["pytest>=8.3,<10"]
 
 [project.scripts]
 gal = "graphalphalab.cli:main"
+gal-dual-theme = "graphalphalab.dual_theme_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
