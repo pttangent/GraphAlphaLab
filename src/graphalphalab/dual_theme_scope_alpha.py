@@ -268,7 +268,16 @@ def _prepare_inter_factor(
                 row[column] = _weighted_mean(group[column], member_weight)
             else:
                 non_null = group[column].dropna()
-                row[column] = non_null.iloc[0] if not non_null.empty else None
+                if column == "expected_direction" and non_null.nunique() > 1:
+                    raise ValueError(
+                        "Inter-Theme rows contain conflicting expected_direction "
+                        f"inside context_theme_id={row.get('context_theme_id')!r}"
+                    )
+                row[column] = (
+                    non_null.max()
+                    if column == "signal_available_time" and not non_null.empty
+                    else non_null.iloc[0] if not non_null.empty else None
+                )
         score_values = pd.to_numeric(group[score_column], errors="coerce").dropna()
         row["broadcast_score_spread"] = (
             float(score_values.max() - score_values.min())
