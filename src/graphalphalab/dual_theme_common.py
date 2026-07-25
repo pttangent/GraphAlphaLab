@@ -9,11 +9,16 @@ from .contracts import LabelContract
 
 
 DUAL_THEME_BATCH_ID = "dual_theme_igc"
-DUAL_THEME_EXPORT_VERSION = "GAL_DUAL_THEME_GFF_EXPORT_V1"
-DUAL_THEME_ALPHA_VERSION = "GAL_DUAL_THEME_MULTI_HORIZON_ALPHA_V1"
+DUAL_THEME_EXPORT_VERSION = "GAL_DUAL_THEME_GFF_EXPORT_V2_SCOPE_SEMANTICS"
+DUAL_THEME_ALPHA_VERSION = "GAL_DUAL_THEME_MULTI_HORIZON_ALPHA_V2_SCOPE_SEMANTICS"
 DEFAULT_THEME_FAMILIES = ("momentum_state", "residual_return")
 DEFAULT_SCOPES = ("global", "within_theme", "inter_theme")
 SUPPORTED_VARIANTS = ("node_baseline", "graph_forward", "graph_reverse_placebo")
+SUPPORTED_GFF_CAMPAIGN_VERSIONS = (
+    "SMI_DUAL_THEME_IGC_FULL_SCOPE_COMPARE_V1",
+    "SMI_DUAL_THEME_IGC_FULL_SCOPE_COMPARE_V2_INDUCED_WITHIN",
+)
+INDUCED_WITHIN_GFF_VERSION = "SMI_DUAL_THEME_IGC_FULL_SCOPE_COMPARE_V2_INDUCED_WITHIN"
 
 
 @dataclass(frozen=True)
@@ -151,6 +156,35 @@ def _scope_membership_path(
     return matches[0]
 
 
+def _validate_induced_within_registry(registry: dict[str, object]) -> None:
+    semantics = registry.get("within_theme_semantics")
+    if not isinstance(semantics, dict):
+        raise ValueError("Core4 V2 registry is missing within_theme_semantics")
+    required = {
+        "mode": "induced_global_final_edges",
+        "source": "governed_global_p0_final_edges",
+        "local_residualization": False,
+        "local_candidate_generation": False,
+        "local_lag_selection": False,
+        "local_top_k_or_degree_cap": False,
+        "edge_weight_policy": "preserve_global_edge_weight",
+        "edge_identity_policy": "preserve_global_edge_key",
+        "p1_policy": "rebuild_p1_from_the_induced_edge_graph",
+    }
+    mismatches = {
+        key: {"expected": expected, "observed": semantics.get(key)}
+        for key, expected in required.items()
+        if semantics.get(key) != expected
+    }
+    if mismatches:
+        raise ValueError(f"Unsupported induced Within-Theme semantics: {mismatches}")
+    scope_policy = registry.get("igc_scope_policy")
+    if not isinstance(scope_policy, dict):
+        raise ValueError("Core4 V2 registry is missing igc_scope_policy")
+    if "aggregate_cross-theme edges" not in str(scope_policy.get("inter_theme", "")):
+        raise ValueError("Core4 V2 Inter-Theme scope policy is not the governed aggregation")
+
+
 def load_gff_campaign_contract(campaign_root: str | Path) -> dict[str, object]:
     root = Path(campaign_root).expanduser().resolve()
     path = root / "runs" / "campaign_contract.json"
@@ -168,9 +202,10 @@ def load_gff_campaign_contract(campaign_root: str | Path) -> dict[str, object]:
         or payload.get("campaign_implementation_version")
         or ""
     )
-    if version != "SMI_DUAL_THEME_IGC_FULL_SCOPE_COMPARE_V1":
+    if version not in SUPPORTED_GFF_CAMPAIGN_VERSIONS:
         raise ValueError(
-            f"Unsupported GFF campaign version {version!r}; expected dual-theme V1"
+            f"Unsupported GFF campaign version {version!r}; "
+            f"supported={SUPPORTED_GFF_CAMPAIGN_VERSIONS}"
         )
     consensus = registry.get("consensus", {})
     if isinstance(consensus, dict) and bool(consensus.get("enabled")):
@@ -178,12 +213,15 @@ def load_gff_campaign_contract(campaign_root: str | Path) -> dict[str, object]:
     families = tuple(str(value) for value in registry.get("theme_family_order", ()))
     if families and families != DEFAULT_THEME_FAMILIES:
         raise ValueError(f"Unexpected Theme families: {families}")
+    if version == INDUCED_WITHIN_GFF_VERSION:
+        _validate_induced_within_registry(registry)
     return {
         "path": path,
         "payload": payload,
         "contract": contract,
         "registry": registry,
         "dates": dates,
+        "campaign_version": version,
     }
 
 
@@ -284,11 +322,9 @@ def discover_dual_theme_partitions(
                 if not nodes.exists():
                     continue
                 trade_date = _path_value(edges, "date")
-                membership = None
-                if scope == "inter_theme":
-                    if not trade_date:
-                        raise ValueError(f"Cannot infer trade_date from {edges}")
-                    membership = _scope_membership_path(root, family, trade_date)
+                if not trade_date:
+                    raise ValueError(f"Cannot infer trade_date from {edges}")
+                membership = _scope_membership_path(root, family, trade_date)
                 rows.append(P0Partition(scope, family, edges, nodes, membership))
     if not rows:
         raise FileNotFoundError(f"No dual-theme GFF P0 partitions found below {root}")
