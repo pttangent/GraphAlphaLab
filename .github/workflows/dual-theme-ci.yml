@@ -17,6 +17,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      pytest_summary: ${{ steps.pytest.outputs.pytest_summary }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,4 +32,21 @@ jobs:
       - name: Compile
         run: python -m compileall -q src scripts tests
       - name: Test
-        run: python -m pytest -q --tb=short
+        id: pytest
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q --tb=line > pytest.log 2>&1
+          status=$?
+          summary=$(tail -n 1 pytest.log | tr -cd '[:alnum:] _.,:=/-' | cut -c1-180)
+          echo "pytest_summary=$summary" >> "$GITHUB_OUTPUT"
+          cat pytest.log
+          exit $status
+
+  diagnostic:
+    name: "pytest summary: ${{ needs.test.outputs.pytest_summary }}"
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ needs.test.outputs.pytest_summary }}"
