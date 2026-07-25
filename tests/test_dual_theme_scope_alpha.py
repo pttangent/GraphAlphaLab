@@ -73,6 +73,22 @@ def test_inter_theme_alpha_uses_one_weighted_portfolio_return_per_theme() -> Non
     }
 
 
+def test_inter_theme_rejects_conflicting_broadcast_scores() -> None:
+    rows = _base_rows()
+    rows["factor_id"] = [
+        "inter_theme::momentum_state::layer::graph_forward"
+    ] * 6
+    rows["score"] = [0.5, 0.5, 0.6, -0.25, -0.25, -0.25]
+    with pytest.raises(ValueError, match="non-identical stock scores"):
+        _prepare_inter_factor(
+            pd.DataFrame(rows),
+            score_column="score",
+            control_columns=(),
+            min_theme_cross_section=2,
+            min_theme_size=3,
+        )
+
+
 def test_core4_v2_induced_within_contract_is_accepted(tmp_path: Path) -> None:
     campaign = tmp_path / "campaign"
     runs = campaign / "runs"
