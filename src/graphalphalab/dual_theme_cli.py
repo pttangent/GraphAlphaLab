@@ -32,6 +32,41 @@ def _lineage_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--require-clean", action="store_true")
 
 
+def _alpha_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--metadata", type=Path)
+    parser.add_argument("--metadata-id", default="symbol_id")
+    parser.add_argument("--metadata-signal-id", default="symbol_id")
+    parser.add_argument("--slice-dimensions")
+    parser.add_argument("--join-keys", default="trade_date,decision_time,symbol_id")
+    parser.add_argument("--score-column", default="score")
+    parser.add_argument("--symbol-column", default="symbol_id")
+    parser.add_argument("--quantiles", type=int, default=5)
+    parser.add_argument("--min-cross-section", type=int, default=100)
+    parser.add_argument(
+        "--min-theme-size",
+        type=int,
+        default=5,
+        help="Minimum canonical member stocks required for a Within/Inter theme observation",
+    )
+    parser.add_argument(
+        "--min-theme-cross-section",
+        type=int,
+        default=5,
+        help="Minimum number of themes required at a decision for Inter-theme Alpha",
+    )
+    parser.add_argument("--direction-column", default="expected_direction")
+    parser.add_argument(
+        "--default-direction",
+        choices=("auto", "positive", "negative"),
+        default="auto",
+    )
+    parser.add_argument("--control-columns", default="own_score")
+    parser.add_argument("--annualization-factor", type=float)
+    parser.add_argument("--correlation-sample-modulus", type=int, default=1000)
+    parser.add_argument("--allow-legacy-signals", action="store_true")
+    parser.add_argument("--allow-partial", action="store_true")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Export and evaluate dual-theme, three-scope GraphFactorFactory outputs"
@@ -60,26 +95,7 @@ def _parser() -> argparse.ArgumentParser:
     alpha.add_argument("--signals", type=Path, required=True)
     alpha.add_argument("--horizon-manifest", type=Path, required=True)
     alpha.add_argument("--output", type=Path, required=True)
-    alpha.add_argument("--metadata", type=Path)
-    alpha.add_argument("--metadata-id", default="symbol_id")
-    alpha.add_argument("--metadata-signal-id", default="symbol_id")
-    alpha.add_argument("--slice-dimensions")
-    alpha.add_argument("--join-keys", default="trade_date,decision_time,symbol_id")
-    alpha.add_argument("--score-column", default="score")
-    alpha.add_argument("--symbol-column", default="symbol_id")
-    alpha.add_argument("--quantiles", type=int, default=5)
-    alpha.add_argument("--min-cross-section", type=int, default=100)
-    alpha.add_argument("--direction-column", default="expected_direction")
-    alpha.add_argument(
-        "--default-direction",
-        choices=("auto", "positive", "negative"),
-        default="auto",
-    )
-    alpha.add_argument("--control-columns", default="own_score")
-    alpha.add_argument("--annualization-factor", type=float)
-    alpha.add_argument("--correlation-sample-modulus", type=int, default=1000)
-    alpha.add_argument("--allow-legacy-signals", action="store_true")
-    alpha.add_argument("--allow-partial", action="store_true")
+    _alpha_args(alpha)
     _resource_args(alpha)
     _lineage_args(alpha)
 
@@ -95,28 +111,9 @@ def _parser() -> argparse.ArgumentParser:
     full.add_argument("--theme-families", default=",".join(DEFAULT_THEME_FAMILIES))
     full.add_argument("--scopes", default=",".join(DEFAULT_SCOPES))
     full.add_argument("--variants", default=",".join(SUPPORTED_VARIANTS))
-    full.add_argument("--metadata", type=Path)
-    full.add_argument("--metadata-id", default="symbol_id")
-    full.add_argument("--metadata-signal-id", default="symbol_id")
-    full.add_argument("--slice-dimensions")
-    full.add_argument("--join-keys", default="trade_date,decision_time,symbol_id")
-    full.add_argument("--score-column", default="score")
-    full.add_argument("--symbol-column", default="symbol_id")
-    full.add_argument("--quantiles", type=int, default=5)
-    full.add_argument("--min-cross-section", type=int, default=100)
-    full.add_argument("--direction-column", default="expected_direction")
-    full.add_argument(
-        "--default-direction",
-        choices=("auto", "positive", "negative"),
-        default="auto",
-    )
-    full.add_argument("--control-columns", default="own_score")
-    full.add_argument("--annualization-factor", type=float)
-    full.add_argument("--correlation-sample-modulus", type=int, default=1000)
-    full.add_argument("--allow-legacy-signals", action="store_true")
-    full.add_argument("--allow-partial", action="store_true")
     full.add_argument("--force-export", action="store_true")
     full.add_argument("--allow-incomplete-campaign", action="store_true")
+    _alpha_args(full)
     _resource_args(full)
     _lineage_args(full)
     return parser
@@ -160,6 +157,8 @@ def main() -> None:
         symbol_column=args.symbol_column,
         quantiles=args.quantiles,
         min_cross_section=args.min_cross_section,
+        min_theme_size=args.min_theme_size,
+        min_theme_cross_section=args.min_theme_cross_section,
         direction_column=args.direction_column or None,
         default_direction=args.default_direction,
         control_columns=_csv_list(args.control_columns),
