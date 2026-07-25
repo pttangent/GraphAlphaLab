@@ -275,6 +275,7 @@ def evaluate_scope_alpha_streaming(
     metadata_id: str = "symbol_id",
     slice_columns: Iterable[str] = (),
     score_column: str = "score",
+    symbol_column: str = "symbol_id",
     quantiles: int = 5,
     min_cross_section: int = 100,
     min_theme_size: int = 5,
@@ -288,6 +289,8 @@ def evaluate_scope_alpha_streaming(
 ) -> AlphaResult:
     if scope not in SCOPE_ALPHA_SEMANTICS:
         raise ValueError(f"Unsupported specialized scope: {scope!r}")
+    if symbol_column != "symbol_id":
+        raise ValueError("Dual-theme scoped Alpha currently requires symbol_column='symbol_id'")
     label_contract.validate()
     keys_join = list(join_keys)
     connection = duckdb.connect()
@@ -421,3 +424,38 @@ def evaluate_scope_alpha_streaming(
             )
         results.append(result)
     return _concat_results(results, audit)
+
+
+def combine_alpha_results(
+    results: Iterable[AlphaResult],
+    *,
+    governance: dict[str, object] | None = None,
+) -> AlphaResult:
+    rows = tuple(results)
+    fields = (
+        "metrics",
+        "ic_series",
+        "daily_ic",
+        "quantile_returns",
+        "portfolio_returns",
+        "stability",
+        "score_correlation",
+    )
+    payload: dict[str, pd.DataFrame] = {}
+    for field in fields:
+        frames = [getattr(row, field) for row in rows if not getattr(row, field).empty]
+        payload[field] = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return AlphaResult(
+        **payload,
+        governance=governance or {
+            "component_governance": [row.governance for row in rows],
+        },
+    )
+
+
+def evaluate_dual_theme_scope_streaming(
+    signals_path: str | Path,
+    labels_path: str | Path,
+    **kwargs: object,
+) -> AlphaResult:
+    return evaluate_scope_alpha_streaming(signals_path, labels_path, **kwargs)
