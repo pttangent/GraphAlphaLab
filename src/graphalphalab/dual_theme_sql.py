@@ -71,7 +71,13 @@ def _stock_query(
 ) -> str:
     edges_path = _sql_path(partition.edges)
     nodes_path = _sql_path(partition.nodes)
+    membership_path = (
+        _sql_path(partition.scope_memberships)
+        if partition.scope_memberships is not None
+        else None
+    )
     layer = str(meta["layer_id"])
+    trade_date = str(meta["trade_date"])
     header = _signal_header(
         batch_id=batch_id,
         scope=partition.scope,
@@ -79,25 +85,82 @@ def _stock_query(
         layer_id=layer,
         variant=variant,
     )
+    membership_cte = ""
+    membership_join = ""
+    context_theme = "NULL::VARCHAR"
+    membership_weight = "NULL::DOUBLE"
+    membership_group = ""
+    if partition.scope == "within_theme":
+        if membership_path is None:
+            raise ValueError("Within-theme export requires canonical scope memberships")
+        membership_cte = f"""
+        , memberships AS (
+          SELECT
+            CAST(trade_date AS VARCHAR) AS trade_date,
+            decision_time,
+            CAST(theme_id AS VARCHAR) AS theme_id,
+            CAST(symbol_id AS BIGINT) AS symbol_id,
+            CAST(membership_weight AS DOUBLE) AS membership_weight
+          FROM read_parquet('{membership_path}', union_by_name=true)
+        )
+        """
+        membership_join = f"""
+        JOIN memberships membership
+          ON CAST(e.trade_date AS VARCHAR)=membership.trade_date
+         AND e.decision_time=membership.decision_time
+         AND {{selected_id}}=membership.symbol_id
+        """
+        context_theme = "membership.theme_id"
+        membership_weight = "membership.membership_weight"
+        membership_group = ", membership.theme_id, membership.membership_weight"
     if variant == "node_baseline":
+        node_membership_cte = ""
+        node_membership_join = ""
+        node_context = "NULL::VARCHAR"
+        node_weight = "NULL::DOUBLE"
+        if partition.scope == "within_theme":
+            if membership_path is None:
+                raise ValueError("Within-theme export requires canonical scope memberships")
+            node_membership_cte = f"""
+            WITH memberships AS (
+              SELECT
+                CAST(trade_date AS VARCHAR) AS trade_date,
+                decision_time,
+                CAST(theme_id AS VARCHAR) AS theme_id,
+                CAST(symbol_id AS BIGINT) AS symbol_id,
+                CAST(membership_weight AS DOUBLE) AS membership_weight
+              FROM read_parquet('{membership_path}', union_by_name=true)
+            )
+            """
+            node_membership_join = """
+            JOIN memberships membership
+              ON CAST(nodes.trade_date AS VARCHAR)=membership.trade_date
+             AND nodes.decision_time=membership.decision_time
+             AND nodes.symbol_id=membership.symbol_id
+            """
+            node_context = "membership.theme_id"
+            node_weight = "membership.membership_weight"
         return f"""
+        {node_membership_cte}
         SELECT {header}
-          CAST(scale_minutes AS INTEGER) AS scale_minutes,
+          CAST(nodes.scale_minutes AS INTEGER) AS scale_minutes,
           '{variant}'::VARCHAR AS variant_id,
-          trade_date,
-          decision_time,
-          p0_snapshot_id,
-          symbol,
-          symbol_id,
-          security_entity_id,
-          node_score::DOUBLE AS score,
+          nodes.trade_date,
+          nodes.decision_time,
+          nodes.p0_snapshot_id,
+          nodes.symbol,
+          nodes.symbol_id,
+          nodes.security_entity_id,
+          nodes.node_score::DOUBLE AS score,
           0::DOUBLE AS own_score,
           0::BIGINT AS edge_count,
-          NULL::VARCHAR AS context_theme_id,
-          NULL::DOUBLE AS membership_weight,
-          decision_time AS signal_available_time
-        FROM read_parquet('{nodes_path}', union_by_name=true)
-        WHERE node_score IS NOT NULL
+          {node_context} AS context_theme_id,
+          {node_weight} AS membership_weight,
+          nodes.decision_time AS signal_available_time
+        FROM read_parquet('{nodes_path}', union_by_name=true) nodes
+        {node_membership_join}
+        WHERE nodes.node_score IS NOT NULL
+          AND CAST(nodes.trade_date AS VARCHAR)='{trade_date}'
         """
     if variant == "graph_forward":
         selected_symbol = "any_value(dst.symbol)"
@@ -119,6 +182,7 @@ def _stock_query(
         )
         own = "any_value(src.node_score)"
         valid = "dst.node_score IS NOT NULL"
+    scoped_join = membership_join.format(selected_id=selected_id)
     return f"""
     WITH edges AS (
       SELECT * FROM read_parquet('{edges_path}', union_by_name=true)
@@ -126,6 +190,7 @@ def _stock_query(
     ), nodes AS (
       SELECT * FROM read_parquet('{nodes_path}', union_by_name=true)
     )
+    {membership_cte}
     SELECT {header}
       CAST(any_value(e.scale_minutes) AS INTEGER) AS scale_minutes,
       '{variant}'::VARCHAR AS variant_id,
@@ -138,8 +203,8 @@ def _stock_query(
       {score} AS score,
       {own} AS own_score,
       count(*)::BIGINT AS edge_count,
-      NULL::VARCHAR AS context_theme_id,
-      NULL::DOUBLE AS membership_weight,
+      {context_theme} AS context_theme_id,
+      {membership_weight} AS membership_weight,
       max(e.edge_available_time) AS signal_available_time
     FROM edges e
     JOIN nodes src
@@ -150,8 +215,9 @@ def _stock_query(
       ON e.decision_time=dst.decision_time
      AND e.p0_snapshot_id=dst.p0_snapshot_id
      AND e.dst_symbol_id=dst.symbol_id
+    {scoped_join}
     WHERE {valid}
-    GROUP BY e.decision_time, {selected_id}
+    GROUP BY e.decision_time, {selected_id}{membership_group}
     """
 
 
