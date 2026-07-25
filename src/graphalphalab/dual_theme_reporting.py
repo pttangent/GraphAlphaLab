@@ -37,6 +37,77 @@ from .reports import write_report_bundle
 from .streaming import evaluate_alpha_streaming
 
 
+_DIRECT_RETURN_ROLE = "direct_return_alpha"
+_REGIME_ROLE = "risk_or_liquidity_regime_candidate"
+_CROSS_DOMAIN_ROLE = "cross_domain_predictive_diagnostic"
+
+
+def _layer_target_semantics(layer_id: object) -> str:
+    value = str(layer_id or "").strip().lower()
+    for suffix, target in (
+        ("_to_return", "return"),
+        ("_to_volatility", "volatility"),
+        ("_to_liquidity", "liquidity"),
+        ("_to_price_impact", "price_impact"),
+        ("_to_downside_tail", "downside_tail"),
+    ):
+        if value.endswith(suffix):
+            return target
+    return "unknown"
+
+
+def _label_target_semantics(contract: LabelContract) -> str:
+    text = f"{contract.label_id}|{contract.target_column}".lower()
+    if "return" in text:
+        return "return"
+    if "volatil" in text:
+        return "volatility"
+    if "liquidity" in text:
+        return "liquidity"
+    if "price_impact" in text or "impact" in text:
+        return "price_impact"
+    if "downside" in text or "tail" in text:
+        return "downside_tail"
+    return "unknown"
+
+
+def _financial_role(layer_target: str, label_target: str) -> str:
+    if layer_target == label_target == "return":
+        return _DIRECT_RETURN_ROLE
+    if label_target == "return" and layer_target in {
+        "volatility",
+        "liquidity",
+        "price_impact",
+        "downside_tail",
+    }:
+        return _REGIME_ROLE
+    return _CROSS_DOMAIN_ROLE
+
+
+def _apply_financial_semantics(
+    frame: pd.DataFrame,
+    contract: LabelContract,
+) -> pd.DataFrame:
+    if frame.empty or "layer_id" not in frame.columns:
+        return frame
+    label_target = _label_target_semantics(contract)
+    frame["layer_target_semantics"] = frame["layer_id"].map(
+        _layer_target_semantics
+    )
+    frame["label_target_semantics"] = label_target
+    frame["semantic_alignment"] = (
+        frame["layer_target_semantics"] == frame["label_target_semantics"]
+    )
+    frame["financial_role"] = [
+        _financial_role(layer_target, label_target)
+        for layer_target in frame["layer_target_semantics"]
+    ]
+    frame["semantic_promotion_eligible"] = (
+        frame["financial_role"] == _DIRECT_RETURN_ROLE
+    )
+    return frame
+
+
 def _annotate_result(
     result: AlphaResult,
     horizon_name: str,
@@ -65,6 +136,29 @@ def _annotate_result(
                         **SCOPE_ALPHA_SEMANTICS,
                     }
                 ).fillna("unknown")
+        _apply_financial_semantics(frame, contract)
+    if not result.metrics.empty:
+        eligible = result.metrics["semantic_promotion_eligible"].fillna(False).astype(bool)
+        if "governance_ready" in result.metrics.columns:
+            result.metrics["governance_ready"] = (
+                result.metrics["governance_ready"].fillna(False).astype(bool)
+                & eligible
+            )
+        if "research_status" in result.metrics.columns:
+            blocked_candidate = (
+                ~eligible
+                & (result.metrics["research_status"].astype(str) == "candidate")
+            )
+            result.metrics.loc[
+                blocked_candidate,
+                "research_status",
+            ] = "needs_falsification"
+        result.metrics["semantic_governance_status"] = eligible.map(
+            {
+                True: "direct_alpha_semantics_aligned",
+                False: "diagnostic_only_not_direct_return_alpha",
+            }
+        )
     return result
 
 
@@ -81,6 +175,8 @@ def _matched_variant_comparison(metrics: pd.DataFrame) -> pd.DataFrame:
             "horizon",
             "horizon_minutes",
             "scope_alpha_unit",
+            "financial_role",
+            "semantic_promotion_eligible",
         )
         if column in metrics.columns
     ]
@@ -96,6 +192,7 @@ def _matched_variant_comparison(metrics: pd.DataFrame) -> pd.DataFrame:
         columns="variant_id",
         values=value_columns,
         aggfunc="first",
+        dropna=False,
     )
     pivot.columns = [f"{metric}__{variant}" for metric, variant in pivot.columns]
     pivot = pivot.reset_index()
@@ -133,6 +230,8 @@ def _scope_summary(metrics: pd.DataFrame, matched: pd.DataFrame) -> pd.DataFrame
             "horizon",
             "horizon_minutes",
             "scope_alpha_unit",
+            "financial_role",
+            "semantic_promotion_eligible",
         )
         if column in metrics
     ]
@@ -167,6 +266,12 @@ def _scope_summary(metrics: pd.DataFrame, matched: pd.DataFrame) -> pd.DataFrame
             ),
             mean_net_5bps=("net_mean_5bps", "mean"),
             cost_survival_rate=("cost_survives_5bps", "mean"),
+            insufficient_factor_rate=(
+                "research_status",
+                lambda values: float(
+                    (values.astype(str) == "insufficient_or_rejected").mean()
+                ),
+            ),
         )
         .reset_index()
     )
@@ -199,33 +304,105 @@ def _scope_summary(metrics: pd.DataFrame, matched: pd.DataFrame) -> pd.DataFrame
 def _cross_scope_comparison(metrics: pd.DataFrame) -> pd.DataFrame:
     if metrics.empty or "scope" not in metrics.columns:
         return pd.DataFrame()
+    non_global = metrics[metrics["scope"].isin(["within_theme", "inter_theme"])].copy()
+    families = sorted(
+        value
+        for value in non_global.get("theme_family", pd.Series(dtype=str)).dropna().astype(str).unique()
+        if value and value != "shared_global"
+    )
+    comparison_rows = [non_global.assign(comparison_theme_family=non_global["theme_family"])]
+    global_rows = metrics[metrics["scope"] == "global"].copy()
+    for family in families:
+        comparison_rows.append(global_rows.assign(comparison_theme_family=family))
+    working = pd.concat(comparison_rows, ignore_index=True) if comparison_rows else pd.DataFrame()
+    if working.empty:
+        return working
     keys = [
         column
         for column in (
-            "theme_family",
+            "comparison_theme_family",
             "layer_id",
             "scale_minutes",
             "variant_id",
             "horizon",
             "horizon_minutes",
+            "financial_role",
         )
-        if column in metrics.columns
+        if column in working.columns
     ]
     value_columns = [
         column
         for column in ("mean_spearman_ic", "net_mean_5bps", "cost_survives_5bps")
-        if column in metrics.columns
+        if column in working.columns
     ]
     if not keys or not value_columns:
         return pd.DataFrame()
-    pivot = metrics.pivot_table(
+    pivot = working.pivot_table(
         index=keys,
         columns="scope",
         values=value_columns,
         aggfunc="first",
+        dropna=False,
     )
     pivot.columns = [f"{metric}__{scope}" for metric, scope in pivot.columns]
-    return pivot.reset_index()
+    result = pivot.reset_index().rename(
+        columns={"comparison_theme_family": "theme_family"}
+    )
+    for metric in ("mean_spearman_ic", "net_mean_5bps"):
+        global_column = f"{metric}__global"
+        within_column = f"{metric}__within_theme"
+        inter_column = f"{metric}__inter_theme"
+        if global_column in result and within_column in result:
+            result[f"{metric}__within_minus_global"] = (
+                result[within_column] - result[global_column]
+            )
+        if global_column in result and inter_column in result:
+            result[f"{metric}__inter_minus_global"] = (
+                result[inter_column] - result[global_column]
+            )
+        if within_column in result and inter_column in result:
+            result[f"{metric}__inter_minus_within"] = (
+                result[inter_column] - result[within_column]
+            )
+    return result
+
+
+def _semantic_summary(metrics: pd.DataFrame) -> pd.DataFrame:
+    if metrics.empty:
+        return pd.DataFrame()
+    keys = [
+        column
+        for column in (
+            "financial_role",
+            "layer_target_semantics",
+            "label_target_semantics",
+            "semantic_promotion_eligible",
+            "scope",
+            "theme_family",
+            "horizon",
+        )
+        if column in metrics.columns
+    ]
+    if not keys:
+        return pd.DataFrame()
+    return (
+        metrics.groupby(keys, observed=True, dropna=False)
+        .agg(
+            factor_rows=("factor_id", "size"),
+            unique_factors=("factor_id", "nunique"),
+            candidate_rows=(
+                "research_status",
+                lambda values: int((values.astype(str) == "candidate").sum()),
+            ),
+            insufficient_rows=(
+                "research_status",
+                lambda values: int(
+                    (values.astype(str) == "insufficient_or_rejected").sum()
+                ),
+            ),
+        )
+        .reset_index()
+    )
 
 
 def _scope_path(signals: Path, batch_id: str, scope: str) -> Path:
@@ -262,28 +439,29 @@ def _run_governed_scope_alpha(
     within_root = _scope_path(signals, batch_id, "within_theme")
     inter_root = _scope_path(signals, batch_id, "inter_theme")
     if global_root.exists():
-        global_result = evaluate_alpha_streaming(
-            global_root,
-            labels,
-            label_contract=contract,
-            join_keys=join_keys,
-            metadata=metadata,
-            metadata_signal_id=metadata_signal_id,
-            metadata_id=metadata_id,
-            slice_columns=dimensions,
-            score_column=score_column,
-            symbol_column=symbol_column,
-            quantiles=quantiles,
-            min_cross_section=min_cross_section,
-            direction_column=direction_column,
-            default_direction=default_direction,
-            control_columns=control_columns,
-            annualization_factor=annualization_factor,
-            resource_budget=resource_budget,
-            allow_legacy_signals=allow_legacy_signals,
-            correlation_sample_modulus=correlation_sample_modulus,
+        components.append(
+            evaluate_alpha_streaming(
+                global_root,
+                labels,
+                label_contract=contract,
+                join_keys=join_keys,
+                metadata=metadata,
+                metadata_signal_id=metadata_signal_id,
+                metadata_id=metadata_id,
+                slice_columns=dimensions,
+                score_column=score_column,
+                symbol_column=symbol_column,
+                quantiles=quantiles,
+                min_cross_section=min_cross_section,
+                direction_column=direction_column,
+                default_direction=default_direction,
+                control_columns=control_columns,
+                annualization_factor=annualization_factor,
+                resource_budget=resource_budget,
+                allow_legacy_signals=allow_legacy_signals,
+                correlation_sample_modulus=correlation_sample_modulus,
+            )
         )
-        components.append(global_result)
     if within_root.exists():
         components.append(
             evaluate_dual_theme_scope_streaming(
@@ -530,6 +708,10 @@ def run_dual_theme_alpha_campaign(
                     "global": "stock_global_cross_section",
                     **SCOPE_ALPHA_SEMANTICS,
                 },
+                "financial_semantics_policy": {
+                    "direct_alpha": "only layer target=return joined to return labels",
+                    "risk_layers": "diagnostic regime candidates, never direct Alpha promotion",
+                },
                 "min_theme_size": int(min_theme_size),
                 "min_theme_cross_section": int(min_theme_cross_section),
             },
@@ -556,6 +738,7 @@ def run_dual_theme_alpha_campaign(
             {
                 "horizon": spec.name,
                 "horizon_minutes": contract.horizon_minutes,
+                "label_target_semantics": _label_target_semantics(contract),
                 "report": str(horizon_output),
                 "observed_factors": observed,
                 "expected_factors": expected_factors,
@@ -568,10 +751,12 @@ def run_dual_theme_alpha_campaign(
     matched = _matched_variant_comparison(combined)
     scope_summary = _scope_summary(combined, matched)
     cross_scope = _cross_scope_comparison(combined)
+    semantic_summary = _semantic_summary(combined)
     atomic_write_frame(combined, output / "all_horizons_alpha_metrics.csv")
     atomic_write_frame(matched, output / "matched_variant_comparison.csv")
     atomic_write_frame(scope_summary, output / "scope_family_horizon_summary.csv")
     atomic_write_frame(cross_scope, output / "cross_scope_comparison.csv")
+    atomic_write_frame(semantic_summary, output / "financial_semantics_summary.csv")
     for scope in ("global", "within_theme", "inter_theme"):
         scoped = (
             combined[combined["scope"] == scope].copy()
@@ -579,10 +764,23 @@ def run_dual_theme_alpha_campaign(
             else pd.DataFrame()
         )
         atomic_write_frame(scoped, output / f"{scope}_alpha_metrics.csv")
+    direct_return = (
+        combined[combined["semantic_promotion_eligible"].fillna(False)].copy()
+        if "semantic_promotion_eligible" in combined.columns
+        else pd.DataFrame()
+    )
+    regime_candidates = (
+        combined[~combined["semantic_promotion_eligible"].fillna(False)].copy()
+        if "semantic_promotion_eligible" in combined.columns
+        else pd.DataFrame()
+    )
+    atomic_write_frame(direct_return, output / "direct_return_alpha_metrics.csv")
+    atomic_write_frame(regime_candidates, output / "regime_candidate_metrics.csv")
     ranking = matched.copy()
     ranking_columns = [
         column
         for column in (
+            "semantic_promotion_eligible",
             "abs_ic_increment_vs_node",
             "abs_ic_increment_vs_reverse_placebo",
             "net_5bps_increment_vs_node",
@@ -593,7 +791,7 @@ def run_dual_theme_alpha_campaign(
     if ranking_columns:
         ranking = ranking.sort_values(
             ranking_columns,
-            ascending=False,
+            ascending=[False] * len(ranking_columns),
             na_position="last",
         )
     atomic_write_frame(ranking, output / "ranking.csv")
@@ -613,9 +811,15 @@ def run_dual_theme_alpha_campaign(
         "matched_rows": int(len(matched)),
         "scope_summary_rows": int(len(scope_summary)),
         "cross_scope_rows": int(len(cross_scope)),
+        "direct_return_metric_rows": int(len(direct_return)),
+        "regime_candidate_metric_rows": int(len(regime_candidates)),
         "scope_alpha_contract": {
             "global": "stock_global_cross_section",
             **SCOPE_ALPHA_SEMANTICS,
+        },
+        "financial_semantics_policy": {
+            "direct_return_alpha": "only *_to_return layers evaluated on return labels",
+            "risk_or_liquidity_layers": "reported as regime/cross-domain diagnostics and blocked from direct Alpha promotion",
         },
         "complete": complete_all,
         "one_day_inference_warning": (
@@ -643,15 +847,20 @@ def run_dual_theme_alpha_campaign(
         "canonical theme and tested against theme-demeaned forward stock returns.",
         "- Inter-Theme Alpha: one signal per theme is tested against the "
         "membership-weighted forward return of that theme portfolio.",
+        "- Only `*_to_return` layers joined to return labels are eligible to be "
+        "described as direct return Alpha.",
+        "- Volatility, liquidity, price-impact and downside-tail layers are "
+        "reported separately as regime or cross-domain diagnostics.",
         "- Inter-Theme costs are theme-notional diagnostics; constituent migration "
         "and basket execution costs remain a required promotion overlay.",
         "",
         "One-day output is a mechanism and runtime comparison, not statistical "
         "promotion evidence.",
         "",
-        "Key files: `within_theme_alpha_metrics.csv`, "
+        "Key files: `direct_return_alpha_metrics.csv`, "
+        "`regime_candidate_metrics.csv`, `within_theme_alpha_metrics.csv`, "
         "`inter_theme_alpha_metrics.csv`, `cross_scope_comparison.csv`, "
-        "`scope_family_horizon_summary.csv`, `matched_variant_comparison.csv`, "
+        "`financial_semantics_summary.csv`, `matched_variant_comparison.csv`, "
         "`ranking.csv`.",
     ]
     atomic_write_text(output / "REPORT.md", "\n".join(lines) + "\n")
