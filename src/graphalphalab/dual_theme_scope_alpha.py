@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from pathlib import Path
 from typing import Iterable
 
@@ -8,9 +9,16 @@ import numpy as np
 import pandas as pd
 
 from .alpha import AlphaResult, _bh_fdr, evaluate_alpha
-from .contracts import LabelContract, PitAudit
+from .contracts import LabelContract
 from .governance import ResourceBudget, configure_duckdb
-from .streaming import _audit_pit, _columns, _factor_keys, _factor_where, _sql_literal, _table_expression
+from .streaming import (
+    _audit_pit,
+    _columns,
+    _factor_keys,
+    _factor_where,
+    _sql_literal,
+    _table_expression,
+)
 
 
 SCOPE_ALPHA_SEMANTICS = {
@@ -32,195 +40,27 @@ def _empty_result(governance: dict[str, object] | None = None) -> AlphaResult:
     )
 
 
-def _rank_residualize(
-    frame: pd.DataFrame,
-    *,
-    score_column: str,
-    controls: Iterable[str],
-    group_columns: Iterable[str],
-    min_rows: int,
-) -> pd.Series:
-    group_list = list(group_columns)
-    selected_controls = [column for column in controls if column in frame.columns]
-    result = pd.Series(np.nan, index=frame.index, dtype=float)
-    for _, group in frame.groupby(group_list, observed=True, dropna=False, sort=False):
-        columns = [score_column, *selected_controls]
-        matrix = (
-            group[columns]
-            .apply(pd.to_numeric, errors="coerce")
-            .replace([np.inf, -np.inf], np.nan)
-        )
-        valid = matrix.dropna()
-        if len(valid) < max(min_rows, len(selected_controls) + 3):
-            continue
-        y = valid[score_column].rank(method="average", pct=True).to_numpy(float)
-        design = [np.ones(len(valid))]
-        for control in selected_controls:
-            values = valid[control]
-            if values.nunique() >= 2:
-                design.append(values.rank(method="average", pct=True).to_numpy(float))
-        x = np.column_stack(design)
-        beta = np.linalg.lstsq(x, y, rcond=None)[0]
-        residual = y - x @ beta
-        residual = residual - float(np.nanmean(residual))
-        result.loc[valid.index] = residual
-    return result
-
-
-def prepare_within_theme_factor(
-    frame: pd.DataFrame,
-    *,
-    score_column: str = "score",
-    label_column: str = "target_return",
-    time_column: str = "decision_time",
-    theme_column: str = "context_theme_id",
-    control_columns: Iterable[str] = ("own_score",),
-    min_theme_size: int = 5,
-) -> pd.DataFrame:
-    required = {score_column, label_column, time_column, theme_column, "symbol_id"}
-    missing = sorted(required - set(frame.columns))
-    if missing:
-        raise ValueError(f"Within-theme Alpha input is missing columns: {missing}")
-    data = frame.copy()
-    data[time_column] = pd.to_datetime(data[time_column], utc=True, errors="coerce")
-    data[score_column] = pd.to_numeric(data[score_column], errors="coerce")
-    data[label_column] = pd.to_numeric(data[label_column], errors="coerce")
-    data = data.dropna(subset=[time_column, theme_column, "symbol_id", score_column, label_column])
-    sizes = data.groupby([time_column, theme_column], observed=True)["symbol_id"].transform("nunique")
-    data = data[sizes >= int(min_theme_size)].copy()
-    if data.empty:
-        return data
-    data["raw_score"] = data[score_column]
-    data[score_column] = _rank_residualize(
-        data,
-        score_column=score_column,
-        controls=control_columns,
-        group_columns=(time_column, theme_column),
-        min_rows=int(min_theme_size),
-    )
-    theme_mean = data.groupby([time_column, theme_column], observed=True)[label_column].transform("mean")
-    data["raw_target_return"] = data[label_column]
-    data[label_column] = data[label_column] - theme_mean
-    data["alpha_semantics"] = SCOPE_ALPHA_SEMANTICS["within_theme"]
-    return data.dropna(subset=[score_column, label_column])
-
-
-def prepare_inter_theme_factor(
-    frame: pd.DataFrame,
-    *,
-    score_column: str = "score",
-    label_column: str = "target_return",
-    time_column: str = "decision_time",
-    theme_column: str = "context_theme_id",
-    membership_weight_column: str = "membership_weight",
-    control_columns: Iterable[str] = ("own_score",),
-    min_theme_size: int = 5,
-    min_theme_cross_section: int = 5,
-) -> pd.DataFrame:
-    required = {
-        score_column,
-        label_column,
-        time_column,
-        theme_column,
-        membership_weight_column,
-        "symbol_id",
-    }
-    missing = sorted(required - set(frame.columns))
-    if missing:
-        raise ValueError(f"Inter-theme Alpha input is missing columns: {missing}")
-    data = frame.copy()
-    data[time_column] = pd.to_datetime(data[time_column], utc=True, errors="coerce")
-    data[score_column] = pd.to_numeric(data[score_column], errors="coerce")
-    data[label_column] = pd.to_numeric(data[label_column], errors="coerce")
-    data[membership_weight_column] = pd.to_numeric(
-        data[membership_weight_column], errors="coerce"
-    )
-    data = data.dropna(
-        subset=[time_column, theme_column, "symbol_id", score_column, label_column]
-    )
-    data[membership_weight_column] = data[membership_weight_column].fillna(1.0).clip(lower=0.0)
-    keys = [
-        column
-        for column in (
-            "batch_id",
-            "factor_id",
-            "layer_id",
-            "scale_minutes",
-            "variant_id",
-            "trade_date",
-            time_column,
-            theme_column,
-        )
-        if column in data.columns
+def _concat_frames(results: Iterable[AlphaResult], attribute: str) -> pd.DataFrame:
+    frames = [
+        getattr(result, attribute)
+        for result in results
+        if not getattr(result, attribute).empty
     ]
-    score_spread = data.groupby(keys, observed=True)[score_column].agg(lambda values: float(values.max() - values.min()))
-    if not score_spread.empty and float(score_spread.max()) > 1e-12:
-        raise ValueError(
-            "Inter-theme broadcast rows disagree on the theme score; refusing to aggregate "
-            f"max_spread={float(score_spread.max())}"
-        )
-    controls = [column for column in control_columns if column in data.columns]
-
-    def aggregate(group: pd.DataFrame) -> pd.Series:
-        weights = pd.to_numeric(group[membership_weight_column], errors="coerce").fillna(0.0)
-        positive = weights > 0
-        if int(group.loc[positive, "symbol_id"].nunique()) < int(min_theme_size):
-            return pd.Series(dtype=object)
-        if float(weights.sum()) <= 0:
-            weights = pd.Series(1.0, index=group.index)
-        weights = weights / float(weights.sum())
-        row: dict[str, object] = {
-            score_column: float(pd.to_numeric(group[score_column], errors="coerce").iloc[0]),
-            label_column: float(np.average(pd.to_numeric(group[label_column], errors="coerce"), weights=weights)),
-            "symbol_id": str(group[theme_column].iloc[0]),
-            "theme_member_count": int(group["symbol_id"].nunique()),
-            "membership_weight_sum": float(pd.to_numeric(group[membership_weight_column], errors="coerce").sum()),
-            "signal_available_time": pd.to_datetime(group["signal_available_time"], utc=True).max()
-            if "signal_available_time" in group.columns
-            else pd.to_datetime(group[time_column], utc=True).iloc[0],
-        }
-        for control in controls:
-            row[control] = float(pd.to_numeric(group[control], errors="coerce").iloc[0])
-        if "expected_direction" in group.columns:
-            declared = group["expected_direction"].dropna().unique()
-            if len(declared) > 1:
-                raise ValueError("Inter-theme rows contain conflicting expected directions")
-            row["expected_direction"] = declared[0] if len(declared) else None
-        return pd.Series(row)
-
-    theme = data.groupby(keys, observed=True, dropna=False, sort=False).apply(
-        aggregate, include_groups=False
-    ).reset_index()
-    if theme.empty or score_column not in theme.columns:
-        return pd.DataFrame(columns=[*keys, score_column, label_column, "symbol_id"])
-    theme = theme.dropna(subset=[score_column, label_column, "symbol_id"])
-    counts = theme.groupby(time_column, observed=True)["symbol_id"].transform("nunique")
-    theme = theme[counts >= int(min_theme_cross_section)].copy()
-    if theme.empty:
-        return theme
-    theme["raw_score"] = theme[score_column]
-    theme[score_column] = _rank_residualize(
-        theme,
-        score_column=score_column,
-        controls=controls,
-        group_columns=(time_column,),
-        min_rows=int(min_theme_cross_section),
-    )
-    theme["alpha_semantics"] = SCOPE_ALPHA_SEMANTICS["inter_theme"]
-    return theme.dropna(subset=[score_column, label_column])
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def _refresh_governance(result: AlphaResult, audit: PitAudit) -> AlphaResult:
-    metrics = result.metrics
+def _refresh_governance(metrics: pd.DataFrame, *, pit_passed: bool) -> pd.DataFrame:
     if metrics.empty:
-        result.governance = {"pit_audit": audit.as_dict()}
-        return result
+        return metrics
+    metrics = metrics.copy()
     metrics["fdr_qvalue"], metrics["fdr_pass"] = _bh_fdr(
         metrics["spearman_ic_pvalue_daily"]
     )
-    direction = metrics.get("direction_predeclared", pd.Series(False, index=metrics.index)).fillna(False).astype(bool)
-    annualization = metrics.get("annualization_valid", pd.Series(False, index=metrics.index)).fillna(False).astype(bool)
-    metrics["governance_ready"] = direction & annualization & bool(audit.passed)
+    metrics["governance_ready"] = (
+        metrics["direction_predeclared"].fillna(False)
+        & metrics["annualization_valid"].fillna(False)
+        & bool(pit_passed)
+    )
     metrics["research_status"] = np.select(
         [
             metrics["sample_sufficient"]
@@ -234,36 +74,243 @@ def _refresh_governance(result: AlphaResult, audit: PitAudit) -> AlphaResult:
         ["candidate", "needs_falsification"],
         default="insufficient_or_rejected",
     )
-    result.governance = {"pit_audit": audit.as_dict()}
+    return metrics
+
+
+def combine_alpha_results(
+    results: Iterable[AlphaResult],
+    *,
+    governance: dict[str, object] | None = None,
+) -> AlphaResult:
+    rows = list(results)
+    pit_passed = all(
+        bool(
+            (result.governance or {})
+            .get("pit_audit", {})
+            .get("passed", True)
+        )
+        for result in rows
+    )
+    return AlphaResult(
+        metrics=_refresh_governance(
+            _concat_frames(rows, "metrics"),
+            pit_passed=pit_passed,
+        ),
+        ic_series=_concat_frames(rows, "ic_series"),
+        daily_ic=_concat_frames(rows, "daily_ic"),
+        quantile_returns=_concat_frames(rows, "quantile_returns"),
+        portfolio_returns=_concat_frames(rows, "portfolio_returns"),
+        stability=_concat_frames(rows, "stability"),
+        score_correlation=_concat_frames(rows, "score_correlation"),
+        governance=governance or {
+            "pit_passed": pit_passed,
+            "component_count": len(rows),
+        },
+    )
+
+
+def _rank_residualize(
+    frame: pd.DataFrame,
+    *,
+    group_columns: list[str],
+    score_column: str,
+    control_columns: list[str],
+    min_group_size: int,
+) -> pd.Series:
+    result = pd.Series(np.nan, index=frame.index, dtype=float)
+    for _, group in frame.groupby(
+        group_columns,
+        observed=True,
+        sort=False,
+        dropna=False,
+    ):
+        values = group[[score_column, *control_columns]].apply(
+            pd.to_numeric,
+            errors="coerce",
+        )
+        valid = values.dropna(subset=[score_column])
+        if len(valid) < min_group_size:
+            continue
+        y = valid[score_column].rank(method="average", pct=True).to_numpy(float)
+        columns = [np.ones(len(valid))]
+        for control in control_columns:
+            series = valid[control]
+            if series.notna().sum() < min_group_size or series.nunique(dropna=True) < 2:
+                continue
+            ranked = series.rank(method="average", pct=True)
+            ranked = ranked.fillna(ranked.mean())
+            columns.append(ranked.to_numpy(float))
+        x = np.column_stack(columns)
+        beta = np.linalg.lstsq(x, y, rcond=None)[0]
+        result.loc[valid.index] = y - x @ beta
     return result
 
 
-def _concat_results(results: list[AlphaResult], audit: PitAudit) -> AlphaResult:
-    if not results:
-        return _empty_result({"pit_audit": audit.as_dict()})
-    fields = (
-        "metrics",
-        "ic_series",
-        "daily_ic",
-        "quantile_returns",
-        "portfolio_returns",
-        "stability",
-        "score_correlation",
-    )
-    payload = {
-        field: pd.concat(
-            [getattr(result, field) for result in results if not getattr(result, field).empty],
-            ignore_index=True,
+def _prepare_within_factor(
+    factor: pd.DataFrame,
+    *,
+    score_column: str,
+    control_columns: Iterable[str],
+    min_theme_size: int,
+) -> pd.DataFrame:
+    if "context_theme_id" not in factor.columns:
+        raise ValueError(
+            "Within-Theme signals require context_theme_id. Re-export with "
+            "GAL_DUAL_THEME_GFF_EXPORT_V2_SCOPE_SEMANTICS."
         )
-        if any(not getattr(result, field).empty for result in results)
-        else pd.DataFrame()
-        for field in fields
-    }
-    combined = AlphaResult(**payload, governance={"pit_audit": audit.as_dict()})
-    return _refresh_governance(combined, audit)
+    data = factor.copy()
+    data["context_theme_id"] = data["context_theme_id"].astype("string")
+    data = data.dropna(subset=["context_theme_id", score_column, "target_return"])
+    group_columns = ["decision_time", "context_theme_id"]
+    group_size = data.groupby(group_columns, observed=True)[score_column].transform(
+        "size"
+    )
+    data = data[group_size >= int(min_theme_size)].copy()
+    if data.empty:
+        return data
+    selected_controls = [
+        column for column in control_columns if column in data.columns
+    ]
+    data["scope_score"] = _rank_residualize(
+        data,
+        group_columns=group_columns,
+        score_column=score_column,
+        control_columns=selected_controls,
+        min_group_size=int(min_theme_size),
+    )
+    target = pd.to_numeric(data["target_return"], errors="coerce")
+    data["target_return"] = target
+    data["scope_target_return"] = target - data.groupby(
+        group_columns,
+        observed=True,
+    )["target_return"].transform("mean")
+    data["scope_alpha_unit"] = SCOPE_ALPHA_SEMANTICS["within_theme"]
+    data["scope_member_count"] = group_size.loc[data.index].astype(int)
+    return data.dropna(subset=["scope_score", "scope_target_return"])
 
 
-def evaluate_scope_alpha_streaming(
+def _weighted_mean(values: pd.Series, weights: pd.Series) -> float:
+    numeric = pd.to_numeric(values, errors="coerce")
+    weight = pd.to_numeric(weights, errors="coerce")
+    valid = numeric.notna()
+    numeric = numeric[valid]
+    weight = weight[valid].fillna(0.0).clip(lower=0.0)
+    if numeric.empty:
+        return np.nan
+    if float(weight.sum()) <= 0:
+        return float(numeric.mean())
+    return float(np.average(numeric.to_numpy(float), weights=weight.to_numpy(float)))
+
+
+def _prepare_inter_factor(
+    factor: pd.DataFrame,
+    *,
+    score_column: str,
+    control_columns: Iterable[str],
+    min_theme_cross_section: int,
+    min_theme_size: int = 1,
+) -> pd.DataFrame:
+    if "context_theme_id" not in factor.columns:
+        raise ValueError(
+            "Inter-Theme signals require context_theme_id. Re-export governed "
+            "dual-theme signals."
+        )
+    data = factor.copy()
+    data["context_theme_id"] = data["context_theme_id"].astype("string")
+    data = data.dropna(subset=["context_theme_id", score_column, "target_return"])
+    if data.empty:
+        return data
+    if "membership_weight" not in data.columns:
+        data["membership_weight"] = 1.0
+    identity_columns = [
+        column
+        for column in (
+            "batch_id",
+            "factor_id",
+            "layer_id",
+            "scale_minutes",
+            "variant_id",
+            "trade_date",
+            "decision_time",
+            "context_theme_id",
+        )
+        if column in data.columns
+    ]
+    optional_columns = [
+        column
+        for column in (
+            "signal_available_time",
+            "expected_direction",
+            *control_columns,
+        )
+        if column in data.columns
+    ]
+    rows: list[dict[str, object]] = []
+    for key_values, group in data.groupby(
+        identity_columns,
+        observed=True,
+        sort=False,
+        dropna=False,
+    ):
+        values = key_values if isinstance(key_values, tuple) else (key_values,)
+        row = dict(zip(identity_columns, values))
+        member_weight = pd.to_numeric(
+            group["membership_weight"],
+            errors="coerce",
+        ).fillna(0.0)
+        row[score_column] = _weighted_mean(group[score_column], member_weight)
+        row["target_return"] = _weighted_mean(
+            group["target_return"],
+            member_weight,
+        )
+        for column in optional_columns:
+            if column in control_columns:
+                row[column] = _weighted_mean(group[column], member_weight)
+            else:
+                non_null = group[column].dropna()
+                row[column] = non_null.iloc[0] if not non_null.empty else None
+        score_values = pd.to_numeric(group[score_column], errors="coerce").dropna()
+        row["broadcast_score_spread"] = (
+            float(score_values.max() - score_values.min())
+            if not score_values.empty
+            else np.nan
+        )
+        row["scope_member_count"] = int(group["symbol_id"].nunique())
+        if int(row["scope_member_count"]) < int(min_theme_size):
+            continue
+        row["symbol_id"] = str(row["context_theme_id"])
+        rows.append(row)
+    themes = pd.DataFrame(rows)
+    if themes.empty:
+        return themes
+    spread = pd.to_numeric(
+        themes["broadcast_score_spread"],
+        errors="coerce",
+    ).fillna(0.0)
+    if bool((spread.abs() > 1e-12).any()):
+        raise ValueError(
+            "Inter-Theme broadcast produced non-identical stock scores inside "
+            "the same context_theme_id; refusing ambiguous theme aggregation."
+        )
+    selected_controls = [
+        column for column in control_columns if column in themes.columns
+    ]
+    themes["scope_score"] = _rank_residualize(
+        themes,
+        group_columns=["decision_time"],
+        score_column=score_column,
+        control_columns=selected_controls,
+        min_group_size=int(min_theme_cross_section),
+    )
+    themes["scope_target_return"] = pd.to_numeric(
+        themes["target_return"],
+        errors="coerce",
+    )
+    themes["scope_alpha_unit"] = SCOPE_ALPHA_SEMANTICS["inter_theme"]
+    return themes.dropna(subset=["scope_score", "scope_target_return"])
+
+
+def evaluate_dual_theme_scope_streaming(
     signals_path: str | Path,
     labels_path: str | Path,
     *,
@@ -289,55 +336,72 @@ def evaluate_scope_alpha_streaming(
 ) -> AlphaResult:
     if scope not in SCOPE_ALPHA_SEMANTICS:
         raise ValueError(f"Unsupported specialized scope: {scope!r}")
-    if symbol_column != "symbol_id":
-        raise ValueError("Dual-theme scoped Alpha currently requires symbol_column='symbol_id'")
     label_contract.validate()
     keys_join = list(join_keys)
+    controls = list(control_columns)
     connection = duckdb.connect()
     configure_duckdb(connection, resource_budget)
-    connection.execute(f"CREATE VIEW all_signals AS SELECT * FROM {_table_expression(signals_path)}")
     connection.execute(
-        f"CREATE VIEW signals AS SELECT * FROM all_signals WHERE CAST(scope AS VARCHAR)={_sql_literal(scope)}"
+        f"CREATE VIEW signals AS SELECT * FROM {_table_expression(signals_path)}"
     )
-    connection.execute(f"CREATE VIEW labels AS SELECT * FROM {_table_expression(labels_path)}")
-    audit = _audit_pit(
+    connection.execute(
+        f"CREATE VIEW labels AS SELECT * FROM {_table_expression(labels_path)}"
+    )
+    pit_audit = _audit_pit(
         connection,
         label_contract,
         join_keys=keys_join,
         allow_legacy_signals=allow_legacy_signals,
     )
     signal_columns = _columns(connection, "signals")
-    label_columns = _columns(connection, "labels")
-    required_signal = {*keys_join, "factor_id", "context_theme_id", score_column}
-    if scope == "inter_theme":
-        required_signal.add("membership_weight")
-    missing_signal = sorted(required_signal - signal_columns)
-    if missing_signal:
-        raise ValueError(f"{scope} signals are missing columns: {missing_signal}")
-    missing_label = sorted(set(keys_join) - label_columns)
-    if missing_label:
-        raise ValueError(f"Labels are missing join columns: {missing_label}")
+    required_signal = {"context_theme_id", "membership_weight"}
+    missing_scope = sorted(required_signal - signal_columns)
+    if missing_scope:
+        raise ValueError(
+            f"{scope} signals are missing scope semantics columns: {missing_scope}. "
+            "Re-export the GFF campaign with the V2 GAL exporter."
+        )
     factor_keys, factors = _factor_keys(connection)
+    if factors.empty:
+        return _empty_result(
+            {
+                "pit_audit": pit_audit.as_dict(),
+                "scope": scope,
+                "scope_semantics": SCOPE_ALPHA_SEMANTICS[scope],
+            }
+        )
     select_signal = [
         *factor_keys,
         *keys_join,
-        "symbol",
-        "symbol_id",
+        symbol_column,
         score_column,
         "context_theme_id",
         "membership_weight",
-        "signal_available_time",
-        *[column for column in (direction_column, *control_columns) if column and column in signal_columns],
+        *[
+            column
+            for column in (
+                "signal_available_time",
+                direction_column,
+                *controls,
+            )
+            if column and column in signal_columns
+        ],
     ]
-    select_signal = list(dict.fromkeys(column for column in select_signal if column in signal_columns))
-    join_expression = " AND ".join(f's."{key}"=l."{key}"' for key in keys_join)
-    label_filter = f"CAST(l.label_id AS VARCHAR)={_sql_literal(label_contract.label_id)}"
+    select_signal = list(dict.fromkeys(select_signal))
+    join_expression = " AND ".join(
+        f's."{key}"=l."{key}"' for key in keys_join
+    )
+    label_filter = (
+        f"CAST(l.label_id AS VARCHAR)={_sql_literal(label_contract.label_id)}"
+    )
     results: list[AlphaResult] = []
     for _, factor_row in factors.iterrows():
         where = _factor_where(factor_keys, factor_row)
-        projection = ", ".join(f's."{column}"' for column in select_signal)
+        signal_projection = ", ".join(
+            f's."{column}"' for column in select_signal
+        )
         query = f"""
-        SELECT {projection},
+        SELECT {signal_projection},
                l."{label_contract.target_column}" AS target_return,
                l.label_id,
                l."{label_contract.entry_time_column}" AS entry_time,
@@ -346,66 +410,65 @@ def evaluate_scope_alpha_streaming(
         FROM signals s
         JOIN labels l ON {join_expression}
         WHERE {where} AND {label_filter}
-        ORDER BY s.trade_date, s.decision_time, s.symbol_id
+        ORDER BY s.trade_date, s.decision_time, s."{symbol_column}"
         """
-        frame = connection.execute(query).fetch_df()
-        if frame.empty:
+        factor = connection.execute(query).fetch_df()
+        if factor.empty:
             continue
         if scope == "within_theme":
-            prepared = prepare_within_theme_factor(
-                frame,
+            if metadata is not None:
+                factor = factor.merge(
+                    metadata,
+                    left_on=metadata_signal_id,
+                    right_on=metadata_id,
+                    how="left",
+                    validate="many_to_one",
+                )
+            prepared = _prepare_within_factor(
+                factor,
                 score_column=score_column,
-                control_columns=control_columns,
+                control_columns=controls,
                 min_theme_size=min_theme_size,
             )
-            evaluation_min_cross_section = min_cross_section
-            symbol_column = "symbol_id"
+            scope_min_cross_section = int(min_cross_section)
+            scope_symbol_column = symbol_column
+            scope_slices = list(slice_columns)
         else:
-            prepared = prepare_inter_theme_factor(
-                frame,
+            prepared = _prepare_inter_factor(
+                factor,
                 score_column=score_column,
-                control_columns=control_columns,
-                min_theme_size=min_theme_size,
+                control_columns=controls,
                 min_theme_cross_section=min_theme_cross_section,
+                min_theme_size=min_theme_size,
             )
-            evaluation_min_cross_section = min_theme_cross_section
-            symbol_column = "symbol_id"
+            scope_min_cross_section = int(min_theme_cross_section)
+            scope_symbol_column = "symbol_id"
+            scope_slices = []
         if prepared.empty:
             continue
-        if metadata is not None and scope == "within_theme":
-            if metadata_signal_id not in prepared.columns or metadata_id not in metadata.columns:
-                raise ValueError(
-                    f"Metadata join columns missing: signals={metadata_signal_id!r}, metadata={metadata_id!r}"
-                )
-            prepared = prepared.merge(
-                metadata,
-                left_on=metadata_signal_id,
-                right_on=metadata_id,
-                how="left",
-                validate="many_to_one",
-            )
         result = evaluate_alpha(
             prepared,
-            score_column=score_column,
-            label_column="target_return",
+            score_column="scope_score",
+            label_column="scope_target_return",
             time_column="decision_time",
-            symbol_column=symbol_column,
+            symbol_column=scope_symbol_column,
             trade_date_column="trade_date",
             quantiles=quantiles,
             annualization_factor=annualization_factor,
-            min_cross_section=evaluation_min_cross_section,
-            slice_columns=slice_columns if scope == "within_theme" else (),
+            min_cross_section=scope_min_cross_section,
+            slice_columns=scope_slices,
             direction_column=direction_column,
             default_direction=default_direction,
             control_columns=(),
             label_overlapping=label_contract.overlapping,
             governance={
-                "pit_audit": audit.as_dict(),
+                "pit_audit": pit_audit.as_dict(),
                 "label_contract": label_contract.as_dict(),
-                "alpha_semantics": SCOPE_ALPHA_SEMANTICS[scope],
+                "scope": scope,
+                "scope_semantics": SCOPE_ALPHA_SEMANTICS[scope],
             },
         )
-        for output in (
+        for frame in (
             result.metrics,
             result.ic_series,
             result.daily_ic,
@@ -413,49 +476,40 @@ def evaluate_scope_alpha_streaming(
             result.portfolio_returns,
             result.stability,
         ):
-            if not output.empty:
-                output["scope"] = scope
-                output["alpha_semantics"] = SCOPE_ALPHA_SEMANTICS[scope]
+            if not frame.empty:
+                frame["scope_alpha_unit"] = SCOPE_ALPHA_SEMANTICS[scope]
         if not result.metrics.empty:
-            result.metrics["cost_semantics"] = (
-                "constituent_stock_turnover"
-                if scope == "within_theme"
-                else "theme_notional_turnover_diagnostic_requires_constituent_execution_overlay"
+            result.metrics["scope"] = scope
+            result.metrics["inter_theme_cost_semantics"] = (
+                "theme_portfolio_notional"
+                if scope == "inter_theme"
+                else "stock_turnover"
             )
         results.append(result)
-    return _concat_results(results, audit)
-
-
-def combine_alpha_results(
-    results: Iterable[AlphaResult],
-    *,
-    governance: dict[str, object] | None = None,
-) -> AlphaResult:
-    rows = tuple(results)
-    fields = (
-        "metrics",
-        "ic_series",
-        "daily_ic",
-        "quantile_returns",
-        "portfolio_returns",
-        "stability",
-        "score_correlation",
-    )
-    payload: dict[str, pd.DataFrame] = {}
-    for field in fields:
-        frames = [getattr(row, field) for row in rows if not getattr(row, field).empty]
-        payload[field] = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    return AlphaResult(
-        **payload,
-        governance=governance or {
-            "component_governance": [row.governance for row in rows],
+        del factor, prepared, result
+        gc.collect()
+    if not results:
+        return _empty_result(
+            {
+                "pit_audit": pit_audit.as_dict(),
+                "scope": scope,
+                "scope_semantics": SCOPE_ALPHA_SEMANTICS[scope],
+            }
+        )
+    combined = combine_alpha_results(
+        results,
+        governance={
+            "pit_audit": pit_audit.as_dict(),
+            "label_contract": label_contract.as_dict(),
+            "scope": scope,
+            "scope_semantics": SCOPE_ALPHA_SEMANTICS[scope],
+            "factor_count": int(len(factors)),
+            "streaming_mode": "factor_sequential_duckdb_scope_aware",
+            "resource_budget": resource_budget.as_dict(),
         },
     )
+    return combined
 
 
-def evaluate_dual_theme_scope_streaming(
-    signals_path: str | Path,
-    labels_path: str | Path,
-    **kwargs: object,
-) -> AlphaResult:
-    return evaluate_scope_alpha_streaming(signals_path, labels_path, **kwargs)
+prepare_within_theme_factor = _prepare_within_factor
+prepare_inter_theme_factor = _prepare_inter_factor
