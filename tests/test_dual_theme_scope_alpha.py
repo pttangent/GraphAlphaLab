@@ -6,7 +6,9 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from graphalphalab.dual_theme import _guard_existing_export
 from graphalphalab.dual_theme_common import load_gff_campaign_contract
+from graphalphalab.dual_theme_cross_scope import cross_scope_comparison
 from graphalphalab.dual_theme_scope_alpha import (
     _prepare_inter_factor,
     _prepare_within_factor,
@@ -86,6 +88,81 @@ def test_inter_theme_rejects_conflicting_broadcast_scores() -> None:
             control_columns=(),
             min_theme_cross_section=2,
             min_theme_size=3,
+        )
+
+
+def test_cross_scope_matches_shared_global_to_each_theme_family() -> None:
+    metrics = pd.DataFrame(
+        [
+            {
+                "scope": "global",
+                "theme_family": "shared_global",
+                "layer_id": "layer",
+                "scale_minutes": 30,
+                "variant_id": "graph_forward",
+                "horizon": "30m",
+                "horizon_minutes": 30,
+                "mean_spearman_ic": 0.01,
+                "net_mean_5bps": 0.001,
+            },
+            {
+                "scope": "within_theme",
+                "theme_family": "momentum_state",
+                "scope_alpha_unit": "stock_within_theme_neutral",
+                "factor_id": "within_theme::momentum_state::layer::graph_forward",
+                "layer_id": "layer",
+                "scale_minutes": 30,
+                "variant_id": "graph_forward",
+                "horizon": "30m",
+                "horizon_minutes": 30,
+                "mean_spearman_ic": 0.03,
+                "net_mean_5bps": 0.004,
+            },
+            {
+                "scope": "inter_theme",
+                "theme_family": "residual_return",
+                "scope_alpha_unit": "theme_portfolio_weighted_member_return",
+                "factor_id": "inter_theme::residual_return::layer::graph_forward",
+                "layer_id": "layer",
+                "scale_minutes": 30,
+                "variant_id": "graph_forward",
+                "horizon": "30m",
+                "horizon_minutes": 30,
+                "mean_spearman_ic": -0.02,
+                "net_mean_5bps": -0.001,
+            },
+        ]
+    )
+    result = cross_scope_comparison(metrics)
+    assert len(result) == 2
+    momentum = result[result["theme_family"] == "momentum_state"].iloc[0]
+    residual = result[result["theme_family"] == "residual_return"].iloc[0]
+    assert momentum["mean_spearman_ic_increment_vs_global"] == pytest.approx(0.02)
+    assert momentum["net_5bps_increment_vs_global"] == pytest.approx(0.003)
+    assert residual["abs_ic_increment_vs_global"] == pytest.approx(0.01)
+
+
+def test_existing_export_guard_rejects_legacy_semantics(tmp_path: Path) -> None:
+    output = tmp_path / "signals"
+    output.mkdir()
+    (output / "export_manifest.json").write_text(
+        json.dumps(
+            {
+                "export_version": "GAL_DUAL_THEME_GFF_EXPORT_V1",
+                "parameters": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Existing signal export uses"):
+        _guard_existing_export(
+            output,
+            campaign_root=tmp_path / "campaign",
+            batch_id="dual_theme_igc",
+            theme_families=("momentum_state", "residual_return"),
+            scopes=("global", "within_theme", "inter_theme"),
+            variants=("node_baseline", "graph_forward", "graph_reverse_placebo"),
+            force=False,
         )
 
 
