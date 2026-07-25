@@ -16,10 +16,15 @@ from .dual_theme_common import (
     validate_partition_inventory,
 )
 from .dual_theme_export import export_dual_theme_signals
-from .dual_theme_reporting import (
-    _matched_variant_comparison,
-    run_dual_theme_alpha_campaign,
-)
+from . import dual_theme_reporting as _dual_theme_reporting
+from .dual_theme_cross_scope import cross_scope_comparison
+
+# Global is deliberately shared_global while Within/Inter retain a concrete
+# theme_family. Replace the legacy family-keyed pivot with an explicit
+# many-to-one match before exposing the reporting entrypoint.
+_dual_theme_reporting._cross_scope_comparison = cross_scope_comparison
+_matched_variant_comparison = _dual_theme_reporting._matched_variant_comparison
+run_dual_theme_alpha_campaign = _dual_theme_reporting.run_dual_theme_alpha_campaign
 
 __all__ = [
     "DEFAULT_SCOPES",
