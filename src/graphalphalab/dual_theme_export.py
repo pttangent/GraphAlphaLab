@@ -176,12 +176,18 @@ def export_dual_theme_signals(
         "version": DUAL_THEME_EXPORT_VERSION,
         "batch_id": batch_id,
         "campaign_root": str(campaign),
+        "gff_campaign_version": campaign_contract["campaign_version"],
         "theme_families": list(selected_families),
         "scopes": list(selected_scopes),
         "variants": list(requested_variants),
         "factor_count": len(factor_keys),
         "require_campaign_success": require_campaign_success,
         "partition_inventory": inventory,
+        "scope_semantics": {
+            "global": "stock_cross_section",
+            "within_theme": "canonical_theme_membership_attached_for_theme_neutral_stock_alpha",
+            "inter_theme": "theme_node_signal_broadcast_only_for_weighted_theme_portfolio_label_aggregation",
+        },
     }
     manifest = implementation_manifest(
         operation="export_dual_theme_gff_signals",
@@ -197,6 +203,7 @@ def export_dual_theme_signals(
     manifest.update(
         {
             "export_version": DUAL_THEME_EXPORT_VERSION,
+            "gff_campaign_version": campaign_contract["campaign_version"],
             "output_files": output_files,
             "output_rows": total_rows,
             "factor_count": len(factor_keys),
@@ -206,7 +213,10 @@ def export_dual_theme_signals(
             "edge_pit_violations": total_pit,
             "counts_by_scope_family": counts,
             "inter_theme_projection": (
-                "theme_node_signal_broadcast_to_canonical_scope_members"
+                "theme_node_signal_broadcast_to_canonical_scope_members_for_weighted_theme_return_aggregation"
+            ),
+            "within_theme_projection": (
+                "canonical_context_theme_id_attached_to_each_stock_for_within_theme_neutralization"
             ),
             "global_computation": "shared_once_across_theme_families",
             "partition_inventory": inventory,
@@ -218,6 +228,8 @@ def export_dual_theme_signals(
         {
             "contract_hash": manifest["contract_hash"],
             "factor_count": len(factor_keys),
+            "export_version": DUAL_THEME_EXPORT_VERSION,
+            "gff_campaign_version": campaign_contract["campaign_version"],
         },
     )
     return DualThemeExportSummary(
