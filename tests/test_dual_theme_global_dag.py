@@ -87,3 +87,27 @@ def test_task_identity_includes_horizon_scope_and_factor() -> None:
     assert "horizon=30m" in task.unit_name
     assert "scope=within_theme" in task.unit_name
     assert "factor_id=30m-within_theme-7" in task.unit_name
+import json
+
+from graphalphalab.dual_theme_resumable import stable_export_manifest_record
+
+
+def _export_manifest(path, *, memory_gb, threads, factor_count=318):
+    payload = {
+        "export_version": "GAL_DUAL_THEME_GFF_EXPORT_V2_SCOPE_SEMANTICS",
+        "gff_campaign_version": "SMI_DUAL_THEME_IGC_FULL_SCOPE_COMPARE_V2_INDUCED_WITHIN",
+        "factor_count": factor_count,
+        "parameters": {"batch_id": "dual_theme_igc", "factor_count": factor_count},
+        "resource_budget": {"memory_limit_gb": memory_gb, "threads": threads, "temp_directory": "tmp"},
+        "runtime_versions": {"python": "3.11"},
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_export_manifest_record_ignores_execution_budget(tmp_path) -> None:
+    a = stable_export_manifest_record(_export_manifest(tmp_path / "a.json", memory_gb=64.0, threads=12))
+    b = stable_export_manifest_record(_export_manifest(tmp_path / "b.json", memory_gb=72.0, threads=8))
+    assert a["sha256"] == b["sha256"]
+    c = stable_export_manifest_record(_export_manifest(tmp_path / "c.json", memory_gb=72.0, threads=8, factor_count=42))
+    assert a["sha256"] != c["sha256"]

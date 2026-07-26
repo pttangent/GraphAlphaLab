@@ -35,6 +35,7 @@ from .dual_theme_resumable import (
     _strict_horizon_compatible,
     _write_horizon_checkpoint,
     run_dual_theme_alpha_campaign as _finalize_campaign,
+    stable_export_manifest_record,
 )
 from .dual_theme_scope_alpha import (
     SCOPE_ALPHA_SEMANTICS,
@@ -916,7 +917,7 @@ def run_dual_theme_alpha_campaign(
         contract = LabelContract.from_json(horizon_spec.label_contract)
         label_records = directory_parquet_records(horizon_spec.labels)
         manifest_inputs = [
-            file_record(export_manifest_path),
+            stable_export_manifest_record(export_manifest_path),
             file_record(horizon_spec.label_contract),
             *label_records,
         ]

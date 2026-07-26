@@ -976,6 +976,27 @@ def _write_horizon_checkpoint(
     )
 
 
+def stable_export_manifest_record(export_manifest_path: str | Path) -> dict[str, object]:
+    # The raw manifest bytes embed resource_budget and runtime_versions, so its
+    # file sha256 changes whenever -MemoryLimitGb/-Threads change. Anchor the
+    # checkpoint contract to the math-relevant fields only; execution resources
+    # must not invalidate mathematically equivalent factor checkpoints.
+    path = Path(export_manifest_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return {
+        "path": str(path),
+        "size_bytes": -1,
+        "sha256": sha256_json(
+            {
+                "export_version": payload.get("export_version"),
+                "gff_campaign_version": payload.get("gff_campaign_version"),
+                "factor_count": payload.get("factor_count"),
+                "parameters": payload.get("parameters"),
+            }
+        ),
+    }
+
+
 def _checkpoint_contract_hash(
     *,
     horizon_name: str,
@@ -1119,7 +1140,7 @@ def run_dual_theme_alpha_campaign(
         contract = LabelContract.from_json(spec.label_contract)
         label_records = directory_parquet_records(spec.labels)
         manifest_inputs = [
-            file_record(export_manifest_path),
+            stable_export_manifest_record(export_manifest_path),
             file_record(spec.label_contract),
             *label_records,
         ]
