@@ -13,6 +13,7 @@ param(
     [int]$MinThemeSize = 5,
     [int]$MinThemeCrossSection = 5,
     [int]$CorrelationSampleModulus = 1000,
+    [int]$FactorWorkers = 4,
     [switch]$AllowPartial,
     [switch]$ForceExport,
     [switch]$SkipCleanCheck
@@ -44,6 +45,7 @@ try {
         throw "GFF campaign is missing runs\campaign_contract.json."
     }
     if ($Metadata -and -not (Test-Path $Metadata)) { throw "Missing metadata: $Metadata" }
+    if ($FactorWorkers -le 0) { throw "FactorWorkers must be positive." }
 
     python -m py_compile `
         src/graphalphalab/checkpoint.py `
@@ -74,9 +76,10 @@ try {
         "--min-theme-size", $MinThemeSize,
         "--min-theme-cross-section", $MinThemeCrossSection,
         "--correlation-sample-modulus", $CorrelationSampleModulus,
+        "--factor-workers", $FactorWorkers,
         "--expected-git-commit", $head
     )
-    if (-not $SkipCleanCheck) { $argsList += "--require-clean" }
+    if (-not $SkipCleanCheck) { $ArgsList += "--require-clean" }
     if ($Metadata) {
         $argsList += @(
             "--metadata", $Metadata,
@@ -104,6 +107,7 @@ try {
         if (-not (Test-Path $marker)) { throw "Missing governed output: $marker" }
     }
     Write-Host "Dual-theme scope-correct factor-resumable Alpha workflow complete."
+    Write-Host "Factor workers requested: $FactorWorkers"
     Write-Host "Signals: $SignalsOutput"
     Write-Host "Reports: $ReportOutput"
     Write-Host "Checkpoints: $(Join-Path $ReportOutput '_checkpoints\dual_theme_alpha')"
