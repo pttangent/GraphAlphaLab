@@ -63,10 +63,37 @@ $Temp = "D:\GAL\duckdb_tmp\c4_260701_260722_induced_v2"
   -MinCrossSection 100 `
   -MinThemeSize 5 `
   -MinThemeCrossSection 5 `
-  -CorrelationSampleModulus 0
+  -CorrelationSampleModulus 0 `
+  -FactorWorkers 4
 ```
 
+`FactorWorkers` defaults to `4`, so the final line is explicit but optional.
+
 Do not add `-ForceExport`, `-AllowPartial`, or `-SkipCleanCheck` for the governed run.
+
+## Parallel execution contract
+
+Scopes remain sequential:
+
+```text
+global -> within_theme -> inter_theme
+```
+
+Inside the active scope, factors run with four parallel workers by default. Every worker has:
+
+- an independent DuckDB connection;
+- an independent spill subdirectory;
+- an independent factor checkpoint directory;
+- read-only access to signals, labels and metadata.
+
+The configured `MemoryLimitGb` and `Threads` are total budgets, not per-worker budgets. They are divided across active workers. With the July command:
+
+```text
+Total: 64 GB, 12 DuckDB threads, 4 factor workers
+Per worker: 16 GB, 3 DuckDB threads
+```
+
+The scheduler automatically reduces workers when there are fewer factors, fewer total threads, or insufficient memory. Changing only worker count, total threads, memory or spill path does not invalidate mathematically equivalent factor checkpoints.
 
 ## Checkpoint hierarchy
 
@@ -89,7 +116,7 @@ checkpoint.json
 
 A factor is reused only when all of the following match:
 
-- execution contract hash;
+- mathematical execution contract hash;
 - source hash and factor identity;
 - file SHA-256 and byte count;
 - Parquet row count;
@@ -108,7 +135,7 @@ Completed horizon bundles from the pinned `2d6902b` run can be reused without fa
 - the original pinned/default parameters match;
 - `CorrelationSampleModulus` remains `0`.
 
-An incomplete horizon from the old attempt has no factor checkpoints and must run once under the new branch. After the first new factor completes, every subsequent factor is restartable.
+An incomplete horizon from the old attempt has no factor checkpoints and must run once under the new branch. After the first new factor completes, every subsequent completed factor is restartable.
 
 ## Monitoring
 
@@ -119,7 +146,9 @@ reports\_checkpoints\dual_theme_alpha\horizon=<h>\scope=<scope>\progress.json
 reports\_checkpoints\dual_theme_alpha\horizon=<h>\scope=<scope>\DASHBOARD.md
 ```
 
-After a restart, verify `reused_units` increases. The maximum lost work should be the factor that was executing when the process stopped.
+After a restart, verify `reused_units` increases and `factor_worker_plan.workers` is `4` for a normal 64 GB / 12-thread run.
+
+Because four factors can be in flight simultaneously, an abrupt process kill can require recomputing at most the four factors that had not yet atomically committed. All previously committed factors are reused.
 
 ## Final acceptance
 
@@ -129,6 +158,7 @@ Required:
 reports\_SUCCESS
 reports\summary.json: complete=true
 reports\summary.json: checkpoint_granularity=horizon_and_scope_factor
+reports\summary.json: factor_workers=4
 all six horizon summaries complete
 318 factors per horizon
 zero PIT violations
