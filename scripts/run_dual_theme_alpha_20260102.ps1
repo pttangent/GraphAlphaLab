@@ -12,6 +12,7 @@ param(
     [int]$MinCrossSection = 100,
     [int]$MinThemeSize = 5,
     [int]$MinThemeCrossSection = 5,
+    [int]$CorrelationSampleModulus = 1000,
     [switch]$AllowPartial,
     [switch]$ForceExport,
     [switch]$SkipCleanCheck
@@ -21,9 +22,10 @@ Set-StrictMode -Version Latest
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Push-Location $repoRoot
 try {
+    $expectedBranch = "agent/dual-theme-factor-checkpoint"
     $branch = (git branch --show-current).Trim()
-    if ($branch -ne "agent/dual-theme-alpha-reporting") {
-        throw "Expected branch agent/dual-theme-alpha-reporting, got '$branch'."
+    if ($branch -ne $expectedBranch) {
+        throw "Expected branch $expectedBranch, got '$branch'."
     }
     $head = (git rev-parse HEAD).Trim()
     if ($ExpectedCommit -ne "auto" -and $ExpectedCommit -ne $head) {
@@ -44,11 +46,13 @@ try {
     if ($Metadata -and -not (Test-Path $Metadata)) { throw "Missing metadata: $Metadata" }
 
     python -m py_compile `
+        src/graphalphalab/checkpoint.py `
         src/graphalphalab/dual_theme_common.py `
         src/graphalphalab/dual_theme_sql.py `
         src/graphalphalab/dual_theme_export.py `
         src/graphalphalab/dual_theme_scope_alpha.py `
         src/graphalphalab/dual_theme_reporting.py `
+        src/graphalphalab/dual_theme_resumable.py `
         src/graphalphalab/dual_theme.py `
         src/graphalphalab/dual_theme_cli.py `
         scripts/run_dual_theme_alpha.py
@@ -69,6 +73,7 @@ try {
         "--min-cross-section", $MinCrossSection,
         "--min-theme-size", $MinThemeSize,
         "--min-theme-cross-section", $MinThemeCrossSection,
+        "--correlation-sample-modulus", $CorrelationSampleModulus,
         "--expected-git-commit", $head
     )
     if (-not $SkipCleanCheck) { $argsList += "--require-clean" }
@@ -98,9 +103,10 @@ try {
     )) {
         if (-not (Test-Path $marker)) { throw "Missing governed output: $marker" }
     }
-    Write-Host "Dual-theme scope-correct Alpha workflow complete."
+    Write-Host "Dual-theme scope-correct factor-resumable Alpha workflow complete."
     Write-Host "Signals: $SignalsOutput"
     Write-Host "Reports: $ReportOutput"
+    Write-Host "Checkpoints: $(Join-Path $ReportOutput '_checkpoints\dual_theme_alpha')"
 }
 finally {
     Pop-Location
