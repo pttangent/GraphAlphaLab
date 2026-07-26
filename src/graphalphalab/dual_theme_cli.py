@@ -63,6 +63,15 @@ def _alpha_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--control-columns", default="own_score")
     parser.add_argument("--annualization-factor", type=float)
     parser.add_argument("--correlation-sample-modulus", type=int, default=1000)
+    parser.add_argument(
+        "--factor-workers",
+        type=int,
+        default=4,
+        help=(
+            "Parallel factor workers inside each scope. Each worker receives an "
+            "equal share of the total DuckDB memory/thread budget."
+        ),
+    )
     parser.add_argument("--allow-legacy-signals", action="store_true")
     parser.add_argument("--allow-partial", action="store_true")
 
@@ -169,6 +178,7 @@ def main() -> None:
         allow_legacy_signals=args.allow_legacy_signals,
         correlation_sample_modulus=args.correlation_sample_modulus,
         allow_partial=args.allow_partial,
+        factor_workers=args.factor_workers,
     )
     print(output)
 
