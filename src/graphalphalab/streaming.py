@@ -313,7 +313,11 @@ def evaluate_alpha_streaming(
         if not sample.empty:
             pivot = sample.pivot_table(index=["decision_time", "symbol_id"], columns="factor_key", values="score", aggfunc="mean")
             if pivot.shape[1] >= 2:
-                correlation = pivot.corr(method="spearman").stack(dropna=False).rename("score_spearman_correlation").reset_index()
+                correlation_matrix = pivot.corr(method="spearman")
+                # index and columns share the same axis name; stacking would
+                # create duplicate index level names and reset_index would raise.
+                correlation_matrix.columns = correlation_matrix.columns.rename(None)
+                correlation = correlation_matrix.stack(dropna=False).rename("score_spearman_correlation").reset_index()
                 correlation.columns = ["factor_a", "factor_b", "score_spearman_correlation"]
                 correlation["sample_rows"] = len(sample)
                 correlation["sample_modulus"] = correlation_sample_modulus

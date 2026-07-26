@@ -12,6 +12,8 @@ param(
     [int]$MinCrossSection = 100,
     [int]$MinThemeSize = 5,
     [int]$MinThemeCrossSection = 5,
+    [int]$CorrelationSampleModulus = 1000,
+    [int]$FactorWorkers = 6,
     [switch]$AllowPartial,
     [switch]$ForceExport,
     [switch]$SkipCleanCheck
@@ -21,9 +23,10 @@ Set-StrictMode -Version Latest
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Push-Location $repoRoot
 try {
+    $expectedBranch = "agent/dual-theme-factor-checkpoint"
     $branch = (git branch --show-current).Trim()
-    if ($branch -ne "agent/dual-theme-alpha-reporting") {
-        throw "Expected branch agent/dual-theme-alpha-reporting, got '$branch'."
+    if ($branch -ne $expectedBranch) {
+        throw "Expected branch $expectedBranch, got '$branch'."
     }
     $head = (git rev-parse HEAD).Trim()
     if ($ExpectedCommit -ne "auto" -and $ExpectedCommit -ne $head) {
@@ -31,6 +34,9 @@ try {
     }
     if (-not $SkipCleanCheck -and (git status --porcelain)) {
         throw "Working tree must be clean. Use -SkipCleanCheck only for an explicit diagnostic."
+    }
+    if ($FactorWorkers -lt 1) {
+        throw "FactorWorkers must be >= 1."
     }
     foreach ($path in @($GffCampaignRoot, $HorizonManifest)) {
         if (-not (Test-Path $path)) { throw "Missing required path: $path" }
@@ -44,11 +50,14 @@ try {
     if ($Metadata -and -not (Test-Path $Metadata)) { throw "Missing metadata: $Metadata" }
 
     python -m py_compile `
+        src/graphalphalab/checkpoint.py `
         src/graphalphalab/dual_theme_common.py `
         src/graphalphalab/dual_theme_sql.py `
         src/graphalphalab/dual_theme_export.py `
         src/graphalphalab/dual_theme_scope_alpha.py `
         src/graphalphalab/dual_theme_reporting.py `
+        src/graphalphalab/dual_theme_resumable.py `
+        src/graphalphalab/dual_theme_global_dag.py `
         src/graphalphalab/dual_theme.py `
         src/graphalphalab/dual_theme_cli.py `
         scripts/run_dual_theme_alpha.py
@@ -69,6 +78,8 @@ try {
         "--min-cross-section", $MinCrossSection,
         "--min-theme-size", $MinThemeSize,
         "--min-theme-cross-section", $MinThemeCrossSection,
+        "--correlation-sample-modulus", $CorrelationSampleModulus,
+        "--factor-workers", $FactorWorkers,
         "--expected-git-commit", $head
     )
     if (-not $SkipCleanCheck) { $argsList += "--require-clean" }
@@ -94,13 +105,19 @@ try {
         (Join-Path $ReportOutput "cross_scope_comparison.csv"),
         (Join-Path $ReportOutput "scope_family_horizon_summary.csv"),
         (Join-Path $ReportOutput "matched_variant_comparison.csv"),
-        (Join-Path $ReportOutput "ranking.csv")
+        (Join-Path $ReportOutput "ranking.csv"),
+        (Join-Path $ReportOutput "_checkpoints\dual_theme_alpha\global_dag_progress.json"),
+        (Join-Path $ReportOutput "_checkpoints\dual_theme_alpha\GLOBAL_DAG.md")
     )) {
         if (-not (Test-Path $marker)) { throw "Missing governed output: $marker" }
     }
-    Write-Host "Dual-theme scope-correct Alpha workflow complete."
+    Write-Host "Dual-theme scope-correct global-DAG factor-resumable Alpha workflow complete."
+    Write-Host "Factor workers: $FactorWorkers"
+    Write-Host "Scope barrier: none"
+    Write-Host "Horizon barrier: none"
     Write-Host "Signals: $SignalsOutput"
     Write-Host "Reports: $ReportOutput"
+    Write-Host "Checkpoints: $(Join-Path $ReportOutput '_checkpoints\dual_theme_alpha')"
 }
 finally {
     Pop-Location
