@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from graphalphalab.checkpoint import (
     CheckpointSpec,
@@ -12,6 +13,9 @@ from graphalphalab.checkpoint import (
     load_checkpoint_frames,
     write_progress,
 )
+from graphalphalab.dual_theme_cli import _parser
+from graphalphalab.dual_theme_resumable import resolve_factor_worker_plan
+from graphalphalab.governance import ResourceBudget
 
 
 def test_checkpoint_reuse_requires_matching_contract_source_and_file_hash(tmp_path: Path) -> None:
@@ -92,3 +96,44 @@ def test_atomic_checkpoint_replaces_stale_partial_directory(tmp_path: Path) -> N
 
     assert not (root / "stale.txt").exists()
     assert checkpoint_valid(root, spec, required_files=("summary.parquet",))
+
+
+def test_dual_theme_cli_defaults_to_four_factor_workers() -> None:
+    args = _parser().parse_args(
+        [
+            "alpha",
+            "--signals",
+            "signals",
+            "--horizon-manifest",
+            "horizons.json",
+            "--output",
+            "reports",
+        ]
+    )
+    assert args.factor_workers == 4
+
+
+def test_factor_worker_plan_divides_total_budget_across_four_workers() -> None:
+    plan = resolve_factor_worker_plan(
+        ResourceBudget(memory_limit_gb=64, threads=12, temp_directory="D:/tmp"),
+        requested_workers=4,
+        factor_count=106,
+    )
+    assert plan.requested_workers == 4
+    assert plan.workers == 4
+    assert plan.memory_limit_gb_per_worker == 16.0
+    assert plan.threads_per_worker == 3
+
+
+def test_factor_worker_plan_caps_workers_by_factor_and_resources() -> None:
+    plan = resolve_factor_worker_plan(
+        ResourceBudget(memory_limit_gb=64, threads=12),
+        requested_workers=4,
+        factor_count=2,
+    )
+    assert plan.workers == 2
+    assert plan.memory_limit_gb_per_worker == 32.0
+    assert plan.threads_per_worker == 6
+
+    with pytest.raises(ValueError, match="factor_workers must be positive"):
+        resolve_factor_worker_plan(ResourceBudget(), 0, 10)
