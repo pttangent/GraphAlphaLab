@@ -13,7 +13,7 @@ param(
     [int]$MinThemeSize = 5,
     [int]$MinThemeCrossSection = 5,
     [int]$CorrelationSampleModulus = 1000,
-    [int]$FactorWorkers = 4,
+    [int]$FactorWorkers = 6,
     [switch]$AllowPartial,
     [switch]$ForceExport,
     [switch]$SkipCleanCheck
@@ -35,6 +35,9 @@ try {
     if (-not $SkipCleanCheck -and (git status --porcelain)) {
         throw "Working tree must be clean. Use -SkipCleanCheck only for an explicit diagnostic."
     }
+    if ($FactorWorkers -lt 1) {
+        throw "FactorWorkers must be >= 1."
+    }
     foreach ($path in @($GffCampaignRoot, $HorizonManifest)) {
         if (-not (Test-Path $path)) { throw "Missing required path: $path" }
     }
@@ -45,7 +48,6 @@ try {
         throw "GFF campaign is missing runs\campaign_contract.json."
     }
     if ($Metadata -and -not (Test-Path $Metadata)) { throw "Missing metadata: $Metadata" }
-    if ($FactorWorkers -le 0) { throw "FactorWorkers must be positive." }
 
     python -m py_compile `
         src/graphalphalab/checkpoint.py `
@@ -55,6 +57,7 @@ try {
         src/graphalphalab/dual_theme_scope_alpha.py `
         src/graphalphalab/dual_theme_reporting.py `
         src/graphalphalab/dual_theme_resumable.py `
+        src/graphalphalab/dual_theme_global_dag.py `
         src/graphalphalab/dual_theme.py `
         src/graphalphalab/dual_theme_cli.py `
         scripts/run_dual_theme_alpha.py
@@ -79,7 +82,7 @@ try {
         "--factor-workers", $FactorWorkers,
         "--expected-git-commit", $head
     )
-    if (-not $SkipCleanCheck) { $ArgsList += "--require-clean" }
+    if (-not $SkipCleanCheck) { $argsList += "--require-clean" }
     if ($Metadata) {
         $argsList += @(
             "--metadata", $Metadata,
@@ -102,12 +105,16 @@ try {
         (Join-Path $ReportOutput "cross_scope_comparison.csv"),
         (Join-Path $ReportOutput "scope_family_horizon_summary.csv"),
         (Join-Path $ReportOutput "matched_variant_comparison.csv"),
-        (Join-Path $ReportOutput "ranking.csv")
+        (Join-Path $ReportOutput "ranking.csv"),
+        (Join-Path $ReportOutput "_checkpoints\dual_theme_alpha\global_dag_progress.json"),
+        (Join-Path $ReportOutput "_checkpoints\dual_theme_alpha\GLOBAL_DAG.md")
     )) {
         if (-not (Test-Path $marker)) { throw "Missing governed output: $marker" }
     }
-    Write-Host "Dual-theme scope-correct factor-resumable Alpha workflow complete."
-    Write-Host "Factor workers requested: $FactorWorkers"
+    Write-Host "Dual-theme scope-correct global-DAG factor-resumable Alpha workflow complete."
+    Write-Host "Factor workers: $FactorWorkers"
+    Write-Host "Scope barrier: none"
+    Write-Host "Horizon barrier: none"
     Write-Host "Signals: $SignalsOutput"
     Write-Host "Reports: $ReportOutput"
     Write-Host "Checkpoints: $(Join-Path $ReportOutput '_checkpoints\dual_theme_alpha')"
