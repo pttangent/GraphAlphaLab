@@ -1,17 +1,98 @@
-# Dual-Theme Alpha factor checkpoint runbook
+# Dual-Theme Alpha global DAG + factor checkpoint runbook
 
 ## Fixed identity
 
 ```text
 Repository: ptangent/GraphAlphaLab
 Branch: agent/dual-theme-factor-checkpoint
-Base/pinned semantic implementation: 2d6902b74ee694f252ed7cac099e1b31143494b7
+Base semantic implementation: 2d6902b74ee694f252ed7cac099e1b31143494b7
 GFF campaign: D:\G4C\campaign=c4_260701_260722_induced_v2
 Signals: D:\DEV\AnotherNetworkFactory\warehouses\GFF_warehouse\GAL_alpha\campaign=c4_260701_260722_induced_v2\signals
 Reports: D:\DEV\AnotherNetworkFactory\warehouses\GFF_warehouse\GAL_alpha\campaign=c4_260701_260722_induced_v2\reports
 ```
 
-Do not run the old and new Alpha processes against the same report directory concurrently. Let the current attempt finish or stop it cleanly before starting this branch.
+Do not run two Alpha processes against the same report directory concurrently.
+
+## Scheduler contract
+
+The default scheduler is a global factor DAG:
+
+```text
+ready node = horizon × scope × factor
+default factor workers = 6
+scope scheduling barrier = none
+horizon scheduling barrier = none
+```
+
+All runnable factors from all six horizons and all three scopes enter one bounded ready queue. A completed task immediately releases one worker slot, which is filled by the next globally ready factor. The scheduler does not wait for a scope or horizon to finish before starting work elsewhere.
+
+Dependencies are only:
+
+```text
+factor node
+  -> horizon reducer, after every factor belonging to that horizon is complete
+  -> final campaign reducer, after all horizon reducers are complete
+```
+
+The queue is round-robin interleaved across `horizon × scope` buckets so the first worker wave is not monopolized by one scope or one horizon.
+
+## Resource contract
+
+`MemoryLimitGb` and `Threads` are total run budgets, not per-worker budgets.
+
+With:
+
+```text
+FactorWorkers = 6
+MemoryLimitGb = 64
+Threads = 12
+```
+
+each factor process receives approximately:
+
+```text
+10.67 GB DuckDB memory limit
+2 DuckDB threads
+```
+
+Each process uses its own DuckDB connection and a PID-specific spill directory below `TempDirectory`. This avoids multiplying the total budget by six.
+
+## Checkpoint contract
+
+```text
+L1 horizon:
+reports\horizon=<h>\horizon_checkpoint.json
+reports\horizon=<h>\_SUCCESS
+
+L3 factor:
+reports\_checkpoints\dual_theme_alpha\
+  horizon=<h>\scope=<scope>\factor-<hash>\checkpoint.json
+```
+
+Each factor checkpoint contains:
+
+```text
+metrics.parquet
+ic_series.parquet
+daily_ic.parquet
+quantile_returns.parquet
+portfolio_returns.parquet
+stability.parquet
+checkpoint.json
+```
+
+Reuse requires matching:
+
+- mathematical checkpoint contract hash;
+- scope and factor identity;
+- input file size and SHA-256;
+- output file size and SHA-256;
+- Parquet row counts;
+- complete status.
+
+Worker count, worker memory split, thread split, and spill directory are execution choices. They do not invalidate mathematically equivalent factor checkpoints.
+
+The global DAG keeps compatibility with factor checkpoints written by the earlier scope-sequential factor-checkpoint implementation because it preserves the same checkpoint path, stage, unit identity, and source-hash contract.
 
 ## Git
 
@@ -39,9 +120,9 @@ python -m compileall -q src scripts tests
 python -m pytest -q --tb=short
 ```
 
-## Resume command for the July campaign
+## July campaign command
 
-The July pinned attempts used `correlation_sample_modulus=0`. Keep the same value so compatible completed horizon bundles can be reused.
+Keep `CorrelationSampleModulus=0` to remain compatible with the completed bundles produced by the pinned July attempts.
 
 ```powershell
 $Campaign = "D:\G4C\campaign=c4_260701_260722_induced_v2"
@@ -59,96 +140,49 @@ $Temp = "D:\GAL\duckdb_tmp\c4_260701_260722_induced_v2"
   -Metadata $Metadata `
   -MemoryLimitGb 64 `
   -Threads 12 `
+  -FactorWorkers 6 `
   -TempDirectory $Temp `
   -MinCrossSection 100 `
   -MinThemeSize 5 `
   -MinThemeCrossSection 5 `
-  -CorrelationSampleModulus 0 `
-  -FactorWorkers 4
+  -CorrelationSampleModulus 0
 ```
 
-`FactorWorkers` defaults to `4`, so the final line is explicit but optional.
+Do not add `-ForceExport`, `-AllowPartial`, or `-SkipCleanCheck` for a governed run.
 
-Do not add `-ForceExport`, `-AllowPartial`, or `-SkipCleanCheck` for the governed run.
+## Restart behavior
 
-## Parallel execution contract
+Rerun the exact same command.
 
-Scopes remain sequential:
+The scheduler first validates:
 
-```text
-global -> within_theme -> inter_theme
-```
+1. complete horizon bundles;
+2. factor checkpoints across every horizon and scope;
+3. only invalid or missing factor nodes enter the ready queue.
 
-Inside the active scope, factors run with four parallel workers by default. Every worker has:
+A process failure can lose at most the factor tasks that were actively running. By default that is at most six factors, not a full scope or horizon.
 
-- an independent DuckDB connection;
-- an independent spill subdirectory;
-- an independent factor checkpoint directory;
-- read-only access to signals, labels and metadata.
-
-The configured `MemoryLimitGb` and `Threads` are total budgets, not per-worker budgets. They are divided across active workers. With the July command:
-
-```text
-Total: 64 GB, 12 DuckDB threads, 4 factor workers
-Per worker: 16 GB, 3 DuckDB threads
-```
-
-The scheduler automatically reduces workers when there are fewer factors, fewer total threads, or insufficient memory. Changing only worker count, total threads, memory or spill path does not invalidate mathematically equivalent factor checkpoints.
-
-## Checkpoint hierarchy
-
-```text
-L1: reports\horizon=<h>\_SUCCESS
-L2/L3: reports\_checkpoints\dual_theme_alpha\horizon=<h>\scope=<scope>\factor-<hash>\checkpoint.json
-```
-
-Each factor directory contains validated Parquet frames:
-
-```text
-metrics.parquet
-ic_series.parquet
-daily_ic.parquet
-quantile_returns.parquet
-portfolio_returns.parquet
-stability.parquet
-checkpoint.json
-```
-
-A factor is reused only when all of the following match:
-
-- mathematical execution contract hash;
-- source hash and factor identity;
-- file SHA-256 and byte count;
-- Parquet row count;
-- complete checkpoint status.
-
-A corrupt or parameter-incompatible checkpoint is rebuilt automatically. Never delete all checkpoints merely because one unit is invalid.
-
-## Current pinned-attempt compatibility
-
-Completed horizon bundles from the pinned `2d6902b` run can be reused without factor checkpoints only when:
-
-- horizon `_SUCCESS` exists;
-- report summary is complete;
-- exactly 318 factor identities are present;
-- export manifest, label contracts, label files and metadata hashes match;
-- the original pinned/default parameters match;
-- `CorrelationSampleModulus` remains `0`.
-
-An incomplete horizon from the old attempt has no factor checkpoints and must run once under the new branch. After the first new factor completes, every subsequent completed factor is restartable.
+A corrupt checkpoint is rebuilt individually. Do not delete the full `_checkpoints` directory.
 
 ## Monitoring
 
-Per-scope progress is written to:
+Global DAG:
 
 ```text
-reports\_checkpoints\dual_theme_alpha\horizon=<h>\scope=<scope>\progress.json
-reports\_checkpoints\dual_theme_alpha\horizon=<h>\scope=<scope>\DASHBOARD.md
+reports\_checkpoints\dual_theme_alpha\global_dag_progress.json
+reports\_checkpoints\dual_theme_alpha\GLOBAL_DAG.md
 ```
 
-After a restart, verify `reused_units` increases and `factor_worker_plan.workers` is `4` for a normal 64 GB / 12-thread run.
+The dashboard reports:
 
-Because four factors can be in flight simultaneously, an abrupt process kill can require recomputing at most the four factors that had not yet atomically committed. All previously committed factors are reused.
+- total, completed, reused, failed, and remaining tasks;
+- six active factor nodes;
+- progress by horizon;
+- explicit `scope_barrier=false`;
+- explicit `horizon_barrier=false`;
+- last completed factor.
+
+Factor checkpoints remain under their horizon/scope paths for inspection.
 
 ## Final acceptance
 
@@ -157,8 +191,10 @@ Required:
 ```text
 reports\_SUCCESS
 reports\summary.json: complete=true
-reports\summary.json: checkpoint_granularity=horizon_and_scope_factor
-reports\summary.json: factor_workers=4
+reports\summary.json: scheduler.mode=global_factor_dag
+reports\summary.json: scheduler.factor_workers=6
+reports\summary.json: scheduler.scope_barrier=false
+reports\summary.json: scheduler.horizon_barrier=false
 all six horizon summaries complete
 318 factors per horizon
 zero PIT violations
