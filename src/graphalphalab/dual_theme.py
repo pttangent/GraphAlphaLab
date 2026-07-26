@@ -22,10 +22,8 @@ from .dual_theme_common import (
     validate_partition_inventory,
 )
 from .dual_theme_export import export_dual_theme_signals as _export_dual_theme_signals
-from .dual_theme_reporting import (
-    _matched_variant_comparison,
-    run_dual_theme_alpha_campaign,
-)
+from .dual_theme_reporting import _matched_variant_comparison
+from .dual_theme_resumable import run_dual_theme_alpha_campaign
 
 
 def _normalized_strings(values: Iterable[str]) -> list[str]:
