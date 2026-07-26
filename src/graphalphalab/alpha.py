@@ -136,6 +136,71 @@ def _daily_ttest(values: pd.Series) -> tuple[float, float]:
     return tstat, pvalue
 
 
+def _insufficient_metric(
+    key: dict[str, object],
+    data: pd.DataFrame,
+    *,
+    score_column: str,
+    label_column: str,
+    symbol_column: str,
+    cost_bps: tuple[float, ...],
+    label_overlapping: bool,
+    declared_direction: int | None,
+) -> dict[str, object]:
+    # Single-factor callers (e.g. the global factor DAG) turn this dict into a
+    # one-row metrics frame, so it must expose the exact column set of the full
+    # path below; otherwise downstream FDR/status columns raise KeyError.
+    metric: dict[str, object] = {
+        **key,
+        "observations": int(len(data)),
+        "decision_count": 0,
+        "date_count": 0,
+        "symbol_count": int(data[symbol_column].nunique()),
+        "label_mean": float(data[label_column].mean()),
+        "label_std": float(data[label_column].std(ddof=1)),
+        "score_mean": float(data[score_column].mean()),
+        "score_std": float(data[score_column].std(ddof=1)),
+        "mean_spearman_ic": np.nan,
+        "median_spearman_ic": np.nan,
+        "spearman_ic_std": np.nan,
+        "spearman_icir": np.nan,
+        "snapshot_ic_positive_rate": np.nan,
+        "daily_ic_positive_rate": np.nan,
+        "daily_ic_negative_rate": np.nan,
+        "daily_ic_sign_consistency": np.nan,
+        "spearman_ic_tstat_daily": np.nan,
+        "spearman_ic_pvalue_daily": np.nan,
+        "mean_pearson_ic_daily": np.nan,
+        "expected_direction": declared_direction if declared_direction is not None else np.nan,
+        "direction_source": "predeclared" if declared_direction is not None else "insufficient_data",
+        "direction_predeclared": declared_direction is not None,
+        "raw_top_minus_bottom_mean": np.nan,
+        "oriented_long_short_mean": np.nan,
+        "oriented_long_short_std": np.nan,
+        "oriented_long_short_hit_rate": np.nan,
+        "oriented_long_short_tstat_daily": np.nan,
+        "annualization_valid": False,
+        "annualized_sharpe": np.nan,
+        "daily_diagnostic_sharpe": np.nan,
+        "label_overlapping": label_overlapping,
+        "max_drawdown": np.nan,
+        "var_5pct": np.nan,
+        "cvar_5pct": np.nan,
+        "skew": np.nan,
+        "kurtosis": np.nan,
+        "mean_turnover": np.nan,
+        "quantile_monotonicity": np.nan,
+    }
+    for bps in cost_bps:
+        metric[f"net_mean_{bps:g}bps"] = np.nan
+        metric[f"net_daily_diagnostic_sharpe_{bps:g}bps"] = np.nan
+    metric["cost_survives_5bps"] = False
+    metric["direction_consistent"] = False
+    metric["sample_sufficient"] = False
+    metric["research_status"] = "insufficient_or_rejected"
+    return metric
+
+
 def _evaluate_factor(
     factor: pd.DataFrame,
     *,
@@ -199,7 +264,16 @@ def _evaluate_factor(
 
     ic_frame = pd.DataFrame(ic_rows)
     if ic_frame.empty:
-        metric = {**key, "observations": int(len(data)), "decision_count": 0, "date_count": 0, "symbol_count": int(data[symbol_column].nunique()), "sample_sufficient": False, "research_status": "insufficient_or_rejected"}
+        metric = _insufficient_metric(
+            key,
+            data,
+            score_column=score_column,
+            label_column=label_column,
+            symbol_column=symbol_column,
+            cost_bps=cost_bps,
+            label_overlapping=label_overlapping,
+            declared_direction=declared_direction,
+        )
         return metric, ic_rows, [], quantile_rows, portfolio_rows, stability_rows
     daily_ic = (
         ic_frame.groupby(trade_date_column, observed=True)[["spearman_ic", "pearson_ic"]]
@@ -446,7 +520,11 @@ def evaluate_alpha(
             sampled = sampled[(hashed % max(1, len(sampled) // 500_000)) == 0]
         pivot = sampled.pivot_table(index=[time_column, symbol_column], columns="_factor_key", values=score_column, aggfunc="mean")
         if pivot.shape[1] >= 2:
-            score_correlation = pivot.corr(method="spearman").stack(dropna=False).rename("score_spearman_correlation").reset_index()
+            correlation_matrix = pivot.corr(method="spearman")
+            # index and columns share the same axis name; stacking would create
+            # duplicate index level names and make reset_index raise.
+            correlation_matrix.columns = correlation_matrix.columns.rename(None)
+            score_correlation = correlation_matrix.stack(dropna=False).rename("score_spearman_correlation").reset_index()
             score_correlation.columns = ["factor_a", "factor_b", "score_spearman_correlation"]
             score_correlation["sample_rows"] = int(len(sampled))
     return AlphaResult(

@@ -1096,6 +1096,7 @@ def run_dual_theme_alpha_campaign(
     active: dict[object, FactorTask] = {}
     last_completed: str | None = None
     failed = 0
+    failures: list[str] = []
     _write_global_progress(
         checkpoint_root,
         status="running",
@@ -1142,7 +1143,20 @@ def run_dual_theme_alpha_campaign(
                     done, _ = wait(active, return_when=FIRST_COMPLETED)
                     for future in done:
                         task = active.pop(future)
-                        result = future.result()
+                        try:
+                            result = future.result()
+                        except Exception as exc:
+                            # Record the failure and keep scheduling; horizon and
+                            # campaign reducers enforce factor completeness, so an
+                            # incomplete run can never publish _SUCCESS.
+                            failed += 1
+                            failures.append(f"{task.unit_name}: {exc!r}")
+                            if ordered_pending:
+                                replacement = ordered_pending.popleft()
+                                active[
+                                    executor.submit(_run_factor_task, replacement)
+                                ] = replacement
+                            continue
                         last_completed = str(result["unit"])
                         completed += 1
                         horizon_counts = counts_by_horizon[task.horizon]
@@ -1167,9 +1181,14 @@ def run_dual_theme_alpha_campaign(
                         active=(task.unit_name for task in active.values()),
                         counts_by_horizon=counts_by_horizon,
                         last_completed=last_completed,
+                        error="; ".join(failures) if failures else None,
                     )
         for horizon_name in plans:
             maybe_finalize(horizon_name)
+        if failures:
+            raise RuntimeError(
+                f"{len(failures)} factor task(s) failed: " + "; ".join(failures[:20])
+            )
     except Exception as exc:
         failed += 1
         _write_global_progress(

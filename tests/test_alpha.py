@@ -52,3 +52,34 @@ def test_alpha_metrics_detect_signal() -> None:
     assert not result.portfolio_returns.empty
     assert not result.daily_ic.empty
     assert not result.stability.empty
+
+
+def test_alpha_single_factor_insufficient_cross_section_has_full_columns() -> None:
+    frame = _frame()
+    frame = frame[frame["symbol_id"].isin(["S000", "S001"])].copy()
+    result = evaluate_alpha(frame, min_cross_section=10)
+    reference = evaluate_alpha(_frame(), min_cross_section=10)
+    assert len(result.metrics) == 1
+    missing = sorted(set(reference.metrics.columns) - set(result.metrics.columns))
+    assert not missing
+    row = result.metrics.iloc[0]
+    assert row["research_status"] == "insufficient_or_rejected"
+    assert not row["sample_sufficient"]
+    assert np.isnan(row["spearman_ic_pvalue_daily"])
+    assert np.isnan(row["fdr_qvalue"])
+    assert not row["fdr_pass"]
+
+
+def test_alpha_score_correlation_handles_shared_axis_name() -> None:
+    base = _frame()
+    other = base.copy()
+    other["factor_id"] = "second_factor"
+    other["score"] = -other["score"]
+    combined = pd.concat([base, other], ignore_index=True)
+    result = evaluate_alpha(combined, min_cross_section=10)
+    assert not result.score_correlation.empty
+    assert list(result.score_correlation.columns)[:3] == [
+        "factor_a",
+        "factor_b",
+        "score_spearman_correlation",
+    ]
