@@ -98,7 +98,7 @@ def test_atomic_checkpoint_replaces_stale_partial_directory(tmp_path: Path) -> N
     assert checkpoint_valid(root, spec, required_files=("summary.parquet",))
 
 
-def test_dual_theme_cli_defaults_to_four_factor_workers() -> None:
+def test_dual_theme_cli_defaults_to_six_factor_workers() -> None:
     args = _parser().parse_args(
         [
             "alpha",
@@ -110,25 +110,25 @@ def test_dual_theme_cli_defaults_to_four_factor_workers() -> None:
             "reports",
         ]
     )
-    assert args.factor_workers == 4
+    assert args.factor_workers == 6
 
 
-def test_factor_worker_plan_divides_total_budget_across_four_workers() -> None:
+def test_factor_worker_plan_divides_total_budget_across_six_workers() -> None:
     plan = resolve_factor_worker_plan(
         ResourceBudget(memory_limit_gb=64, threads=12, temp_directory="D:/tmp"),
-        requested_workers=4,
+        requested_workers=6,
         factor_count=106,
     )
-    assert plan.requested_workers == 4
-    assert plan.workers == 4
-    assert plan.memory_limit_gb_per_worker == 16.0
-    assert plan.threads_per_worker == 3
+    assert plan.requested_workers == 6
+    assert plan.workers == 6
+    assert plan.memory_limit_gb_per_worker == pytest.approx(64 / 6)
+    assert plan.threads_per_worker == 2
 
 
 def test_factor_worker_plan_caps_workers_by_factor_and_resources() -> None:
     plan = resolve_factor_worker_plan(
         ResourceBudget(memory_limit_gb=64, threads=12),
-        requested_workers=4,
+        requested_workers=6,
         factor_count=2,
     )
     assert plan.workers == 2
