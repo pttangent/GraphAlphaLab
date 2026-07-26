@@ -66,10 +66,10 @@ def _alpha_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--factor-workers",
         type=int,
-        default=4,
+        default=6,
         help=(
-            "Parallel factor workers inside each scope. Each worker receives an "
-            "equal share of the total DuckDB memory/thread budget."
+            "Global DAG factor workers. Tasks from every horizon and scope share "
+            "one ready queue; there is no horizon or scope scheduling barrier."
         ),
     )
     parser.add_argument("--allow-legacy-signals", action="store_true")
