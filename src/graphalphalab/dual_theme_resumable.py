@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import gc
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 import json
 from pathlib import Path
+import threading
 from typing import Iterable
 
 import duckdb
@@ -74,6 +76,98 @@ _FRAME_FILES = {
     "portfolio_returns.parquet": "portfolio_returns",
     "stability.parquet": "stability",
 }
+_WORKER_LOCAL = threading.local()
+
+
+@dataclass(frozen=True)
+class FactorWorkerPlan:
+    requested_workers: int
+    workers: int
+    memory_limit_gb_per_worker: float
+    threads_per_worker: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "requested_workers": int(self.requested_workers),
+            "workers": int(self.workers),
+            "memory_limit_gb_per_worker": float(self.memory_limit_gb_per_worker),
+            "threads_per_worker": int(self.threads_per_worker),
+        }
+
+
+@dataclass(frozen=True)
+class _FactorTask:
+    ordinal: int
+    factor_values: dict[str, object]
+    identity: dict[str, object]
+    unit_name: str
+    unit_dir: Path
+    checkpoint_spec: CheckpointSpec
+
+
+@dataclass(frozen=True)
+class _FactorOutcome:
+    ordinal: int
+    unit_name: str
+    result: AlphaResult
+    input_rows: int
+    evaluable_rows: int
+
+
+@dataclass(frozen=True)
+class _ScopeContext:
+    signals_path: Path
+    labels_path: Path
+    scope: str
+    label_contract: LabelContract
+    factor_keys: list[str]
+    join_keys: list[str]
+    signal_projection: str
+    join_expression: str
+    label_filter: str
+    metadata: pd.DataFrame | None
+    metadata_signal_id: str
+    metadata_id: str
+    slice_columns: list[str]
+    score_column: str
+    symbol_column: str
+    quantiles: int
+    min_cross_section: int
+    min_theme_size: int
+    min_theme_cross_section: int
+    direction_column: str | None
+    default_direction: str
+    control_columns: list[str]
+    annualization_factor: float | None
+    allow_legacy_signals: bool
+    governance: dict[str, object]
+    worker_plan: FactorWorkerPlan
+    temp_directory: str | None
+
+
+def resolve_factor_worker_plan(
+    resource_budget: ResourceBudget,
+    requested_workers: int,
+    factor_count: int,
+) -> FactorWorkerPlan:
+    resource_budget.validate()
+    if int(requested_workers) <= 0:
+        raise ValueError("factor_workers must be positive")
+    if int(factor_count) <= 0:
+        return FactorWorkerPlan(int(requested_workers), 1, float(resource_budget.memory_limit_gb), int(resource_budget.threads))
+    memory_cap = max(1, int(float(resource_budget.memory_limit_gb)))
+    workers = min(
+        int(requested_workers),
+        int(factor_count),
+        max(1, int(resource_budget.threads)),
+        memory_cap,
+    )
+    return FactorWorkerPlan(
+        requested_workers=int(requested_workers),
+        workers=max(1, int(workers)),
+        memory_limit_gb_per_worker=float(resource_budget.memory_limit_gb) / max(1, int(workers)),
+        threads_per_worker=max(1, int(resource_budget.threads) // max(1, int(workers))),
+    )
 
 
 def _checkpoint_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -134,6 +228,52 @@ def _scope_path(signals: Path, batch_id: str, scope: str) -> Path:
     return signals / f"batch_id={batch_id}" / f"scope={scope}"
 
 
+def _worker_connection(context: _ScopeContext) -> duckdb.DuckDBPyConnection:
+    key = (
+        str(context.signals_path),
+        str(context.labels_path),
+        context.scope,
+        context.worker_plan.memory_limit_gb_per_worker,
+        context.worker_plan.threads_per_worker,
+        context.temp_directory,
+    )
+    existing_key = getattr(_WORKER_LOCAL, "connection_key", None)
+    connection = getattr(_WORKER_LOCAL, "connection", None)
+    if connection is not None and existing_key == key:
+        return connection
+    if connection is not None:
+        try:
+            connection.close()
+        except Exception:
+            pass
+    worker_temp = None
+    if context.temp_directory:
+        worker_temp = str(
+            Path(context.temp_directory)
+            .expanduser()
+            .resolve()
+            / "factor_workers"
+            / f"scope={context.scope}"
+            / f"worker={threading.get_ident()}"
+        )
+    worker_budget = ResourceBudget(
+        memory_limit_gb=context.worker_plan.memory_limit_gb_per_worker,
+        threads=context.worker_plan.threads_per_worker,
+        temp_directory=worker_temp,
+    )
+    connection = duckdb.connect()
+    configure_duckdb(connection, worker_budget)
+    connection.execute(
+        f"CREATE VIEW signals AS SELECT * FROM {_table_expression(context.signals_path)}"
+    )
+    connection.execute(
+        f"CREATE VIEW labels AS SELECT * FROM {_table_expression(context.labels_path)}"
+    )
+    _WORKER_LOCAL.connection = connection
+    _WORKER_LOCAL.connection_key = key
+    return connection
+
+
 def _score_correlation(
     connection: duckdb.DuckDBPyConnection,
     *,
@@ -183,6 +323,194 @@ def _score_correlation(
     return correlation
 
 
+def _empty_alpha(governance: dict[str, object]) -> AlphaResult:
+    return AlphaResult(
+        metrics=pd.DataFrame(),
+        ic_series=pd.DataFrame(),
+        daily_ic=pd.DataFrame(),
+        quantile_returns=pd.DataFrame(),
+        portfolio_returns=pd.DataFrame(),
+        stability=pd.DataFrame(),
+        score_correlation=pd.DataFrame(),
+        governance=governance,
+    )
+
+
+def _compute_factor(task: _FactorTask, context: _ScopeContext) -> _FactorOutcome:
+    connection = _worker_connection(context)
+    factor_row = pd.Series(task.factor_values)
+    where = _factor_where(context.factor_keys, factor_row)
+    factor = connection.execute(
+        f"""
+        SELECT {context.signal_projection},
+               l."{context.label_contract.target_column}" AS target_return,
+               l.label_id,
+               l."{context.label_contract.entry_time_column}" AS entry_time,
+               l."{context.label_contract.exit_time_column}" AS exit_time,
+               l."{context.label_contract.available_time_column}" AS label_available_time
+        FROM signals s
+        JOIN labels l ON {context.join_expression}
+        WHERE {where} AND {context.label_filter}
+        ORDER BY s.trade_date, s.decision_time, s."{context.symbol_column}"
+        """
+    ).fetch_df()
+    input_rows = int(len(factor))
+    symbol_count = (
+        int(factor[context.symbol_column].nunique())
+        if context.symbol_column in factor.columns and not factor.empty
+        else 0
+    )
+    evaluable_rows = 0
+    if factor.empty and context.scope in SCOPE_ALPHA_SEMANTICS:
+        result = _insufficient_factor_result(
+            factor_row,
+            factor_keys=context.factor_keys,
+            scope=context.scope,
+            pit_audit=context.governance["pit_audit"],
+            label_contract=context.label_contract,
+            reason="no_label_overlap",
+            input_rows=0,
+            evaluable_rows=0,
+            symbol_count=0,
+        )
+    elif factor.empty:
+        result = _empty_alpha(context.governance)
+    else:
+        if context.scope in {"global", "within_theme"} and context.metadata is not None:
+            if (
+                context.metadata_signal_id not in factor.columns
+                or context.metadata_id not in context.metadata.columns
+            ):
+                raise ValueError(
+                    "Metadata join columns missing: "
+                    f"signals={context.metadata_signal_id!r}, metadata={context.metadata_id!r}"
+                )
+            factor = factor.merge(
+                context.metadata,
+                left_on=context.metadata_signal_id,
+                right_on=context.metadata_id,
+                how="left",
+                validate="many_to_one",
+            )
+        if context.scope == "within_theme":
+            prepared = _prepare_within_factor(
+                factor,
+                score_column=context.score_column,
+                control_columns=context.control_columns,
+                min_theme_size=context.min_theme_size,
+            )
+            eval_score = "scope_score"
+            eval_target = "scope_target_return"
+            eval_symbol = context.symbol_column
+            eval_min_cross_section = int(context.min_cross_section)
+            eval_slices = context.slice_columns
+            eval_controls: Iterable[str] = ()
+        elif context.scope == "inter_theme":
+            prepared = _prepare_inter_factor(
+                factor,
+                score_column=context.score_column,
+                control_columns=context.control_columns,
+                min_theme_cross_section=context.min_theme_cross_section,
+                min_theme_size=context.min_theme_size,
+            )
+            eval_score = "scope_score"
+            eval_target = "scope_target_return"
+            eval_symbol = "symbol_id"
+            eval_min_cross_section = int(context.min_theme_cross_section)
+            eval_slices = []
+            eval_controls = ()
+        else:
+            prepared = factor
+            eval_score = context.score_column
+            eval_target = "target_return"
+            eval_symbol = context.symbol_column
+            eval_min_cross_section = int(context.min_cross_section)
+            eval_slices = context.slice_columns
+            eval_controls = context.control_columns
+        evaluable_rows = int(len(prepared))
+        if prepared.empty and context.scope in SCOPE_ALPHA_SEMANTICS:
+            result = _insufficient_factor_result(
+                factor_row,
+                factor_keys=context.factor_keys,
+                scope=context.scope,
+                pit_audit=context.governance["pit_audit"],
+                label_contract=context.label_contract,
+                reason=(
+                    "insufficient_within_theme_members"
+                    if context.scope == "within_theme"
+                    else "insufficient_inter_theme_cross_section"
+                ),
+                input_rows=input_rows,
+                evaluable_rows=0,
+                symbol_count=symbol_count,
+            )
+        elif prepared.empty:
+            result = _empty_alpha(context.governance)
+        else:
+            result = evaluate_alpha(
+                prepared,
+                score_column=eval_score,
+                label_column=eval_target,
+                time_column="decision_time",
+                symbol_column=eval_symbol,
+                trade_date_column="trade_date",
+                quantiles=context.quantiles,
+                annualization_factor=context.annualization_factor,
+                min_cross_section=eval_min_cross_section,
+                slice_columns=eval_slices,
+                direction_column=context.direction_column,
+                default_direction=context.default_direction,
+                control_columns=eval_controls,
+                label_overlapping=context.label_contract.overlapping,
+                governance=context.governance,
+            )
+            if context.scope in SCOPE_ALPHA_SEMANTICS:
+                for frame in (
+                    result.metrics,
+                    result.ic_series,
+                    result.daily_ic,
+                    result.quantile_returns,
+                    result.portfolio_returns,
+                    result.stability,
+                ):
+                    if not frame.empty:
+                        frame["scope_alpha_unit"] = SCOPE_ALPHA_SEMANTICS[context.scope]
+                if not result.metrics.empty:
+                    result.metrics["scope"] = context.scope
+                    result.metrics["scope_input_rows"] = input_rows
+                    result.metrics["scope_evaluable_rows"] = evaluable_rows
+                    result.metrics["scope_drop_reason"] = None
+                    result.metrics["inter_theme_cost_semantics"] = (
+                        "theme_portfolio_notional"
+                        if context.scope == "inter_theme"
+                        else "stock_turnover"
+                    )
+    frames = _result_frames(result)
+    commit_frames(
+        task.unit_dir,
+        task.checkpoint_spec,
+        {
+            name: _checkpoint_frame(frame)
+            for name, frame in frames.items()
+        },
+        metadata={
+            "ordinal": task.ordinal,
+            "scope": context.scope,
+            "factor_identity": task.identity,
+            "input_rows": input_rows,
+            "evaluable_rows": evaluable_rows,
+            "factor_workers": context.worker_plan.workers,
+        },
+    )
+    return _FactorOutcome(
+        ordinal=task.ordinal,
+        unit_name=task.unit_name,
+        result=result,
+        input_rows=input_rows,
+        evaluable_rows=evaluable_rows,
+    )
+
+
 def _evaluate_scope_checkpointed(
     signals_path: Path,
     labels_path: Path,
@@ -209,6 +537,7 @@ def _evaluate_scope_checkpointed(
     resource_budget: ResourceBudget,
     allow_legacy_signals: bool,
     correlation_sample_modulus: int,
+    factor_workers: int,
 ) -> AlphaResult:
     label_contract.validate()
     checkpoint_root.mkdir(parents=True, exist_ok=True)
@@ -249,6 +578,7 @@ def _evaluate_scope_checkpointed(
                     "scope": scope,
                     "checkpoint_granularity": "factor",
                     "factor_count": 0,
+                    "factor_workers": 0,
                 },
             )
         select_signal = [
@@ -278,17 +608,10 @@ def _evaluate_scope_checkpointed(
         label_filter = (
             f"CAST(l.label_id AS VARCHAR)={_sql_literal(label_contract.label_id)}"
         )
-        results: list[AlphaResult] = []
-        unit_states: list[dict[str, object]] = []
-        reused = 0
-        completed = 0
-        total = int(len(factors))
-        write_progress(
-            checkpoint_root,
-            stage=f"dual-theme-{scope}-factor-checkpoints",
-            total=total,
-            completed=0,
-            units=(),
+        worker_plan = resolve_factor_worker_plan(
+            resource_budget,
+            factor_workers,
+            int(len(factors)),
         )
         governance = {
             "pit_audit": pit_audit.as_dict(),
@@ -299,7 +622,44 @@ def _evaluate_scope_checkpointed(
             ),
             "checkpoint_contract_hash": checkpoint_contract_hash,
             "checkpoint_granularity": "factor",
+            "factor_worker_plan": worker_plan.as_dict(),
         }
+        context = _ScopeContext(
+            signals_path=Path(signals_path),
+            labels_path=Path(labels_path),
+            scope=scope,
+            label_contract=label_contract,
+            factor_keys=factor_keys,
+            join_keys=join_keys,
+            signal_projection=signal_projection,
+            join_expression=join_expression,
+            label_filter=label_filter,
+            metadata=metadata,
+            metadata_signal_id=metadata_signal_id,
+            metadata_id=metadata_id,
+            slice_columns=slice_columns,
+            score_column=score_column,
+            symbol_column=symbol_column,
+            quantiles=quantiles,
+            min_cross_section=min_cross_section,
+            min_theme_size=min_theme_size,
+            min_theme_cross_section=min_theme_cross_section,
+            direction_column=direction_column,
+            default_direction=default_direction,
+            control_columns=control_columns,
+            annualization_factor=annualization_factor,
+            allow_legacy_signals=allow_legacy_signals,
+            governance=governance,
+            worker_plan=worker_plan,
+            temp_directory=resource_budget.temp_directory,
+        )
+        results_by_ordinal: dict[int, AlphaResult] = {}
+        unit_states: list[dict[str, object]] = []
+        state_by_ordinal: dict[int, dict[str, object]] = {}
+        pending_tasks: list[_FactorTask] = []
+        reused = 0
+        completed = 0
+        total = int(len(factors))
         for ordinal, (_, factor_row) in enumerate(factors.iterrows(), start=1):
             identity = _factor_identity(factor_keys, factor_row)
             unit_name = "|".join(
@@ -319,247 +679,106 @@ def _evaluate_scope_checkpointed(
                 contract_hash=checkpoint_contract_hash,
                 source_hash=source_hash,
             )
-            state = {
+            state: dict[str, object] = {
                 "unit": unit_name,
-                "status": "pending",
+                "status": "queued",
                 "attempt": 0,
                 "detail": str(unit_dir),
             }
             unit_states.append(state)
+            state_by_ordinal[ordinal] = state
             if checkpoint_valid(
                 unit_dir,
                 checkpoint_spec,
                 required_files=_FRAME_FILES,
             ):
-                results.append(
-                    _result_from_checkpoint(unit_dir, governance=governance)
+                results_by_ordinal[ordinal] = _result_from_checkpoint(
+                    unit_dir,
+                    governance=governance,
                 )
                 reused += 1
                 completed += 1
                 state["status"] = "reused"
-                write_progress(
-                    checkpoint_root,
-                    stage=f"dual-theme-{scope}-factor-checkpoints",
-                    total=total,
-                    completed=completed,
-                    reused=reused,
-                    current=unit_name,
-                    units=unit_states,
-                )
                 continue
-            state["status"] = "running"
-            state["attempt"] = 1
-            write_progress(
-                checkpoint_root,
-                stage=f"dual-theme-{scope}-factor-checkpoints",
-                total=total,
-                completed=completed,
-                reused=reused,
-                current=unit_name,
-                units=unit_states,
-            )
-            where = _factor_where(factor_keys, factor_row)
-            factor = connection.execute(
-                f"""
-                SELECT {signal_projection},
-                       l."{label_contract.target_column}" AS target_return,
-                       l.label_id,
-                       l."{label_contract.entry_time_column}" AS entry_time,
-                       l."{label_contract.exit_time_column}" AS exit_time,
-                       l."{label_contract.available_time_column}" AS label_available_time
-                FROM signals s
-                JOIN labels l ON {join_expression}
-                WHERE {where} AND {label_filter}
-                ORDER BY s.trade_date, s.decision_time, s."{symbol_column}"
-                """
-            ).fetch_df()
-            input_rows = int(len(factor))
-            symbol_count = (
-                int(factor[symbol_column].nunique())
-                if symbol_column in factor.columns and not factor.empty
-                else 0
-            )
-            if factor.empty and scope in SCOPE_ALPHA_SEMANTICS:
-                result = _insufficient_factor_result(
-                    factor_row,
-                    factor_keys=factor_keys,
-                    scope=scope,
-                    pit_audit=pit_audit.as_dict(),
-                    label_contract=label_contract,
-                    reason="no_label_overlap",
-                    input_rows=0,
-                    evaluable_rows=0,
-                    symbol_count=0,
+            pending_tasks.append(
+                _FactorTask(
+                    ordinal=ordinal,
+                    factor_values=factor_row.to_dict(),
+                    identity=identity,
+                    unit_name=unit_name,
+                    unit_dir=unit_dir,
+                    checkpoint_spec=checkpoint_spec,
                 )
-            elif factor.empty:
-                result = AlphaResult(
-                    metrics=pd.DataFrame(),
-                    ic_series=pd.DataFrame(),
-                    daily_ic=pd.DataFrame(),
-                    quantile_returns=pd.DataFrame(),
-                    portfolio_returns=pd.DataFrame(),
-                    stability=pd.DataFrame(),
-                    score_correlation=pd.DataFrame(),
-                    governance=governance,
-                )
-            else:
-                if scope in {"global", "within_theme"} and metadata is not None:
-                    if (
-                        metadata_signal_id not in factor.columns
-                        or metadata_id not in metadata.columns
-                    ):
-                        raise ValueError(
-                            "Metadata join columns missing: "
-                            f"signals={metadata_signal_id!r}, metadata={metadata_id!r}"
+            )
+        write_progress(
+            checkpoint_root,
+            stage=f"dual-theme-{scope}-factor-checkpoints",
+            total=total,
+            completed=completed,
+            reused=reused,
+            units=unit_states,
+            extra={"factor_worker_plan": worker_plan.as_dict()},
+        )
+        failed = 0
+        current_unit: str | None = None
+        if pending_tasks:
+            futures: dict[Future[_FactorOutcome], _FactorTask] = {}
+            with ThreadPoolExecutor(
+                max_workers=worker_plan.workers,
+                thread_name_prefix=f"gal-{scope}-factor",
+            ) as executor:
+                for task in pending_tasks:
+                    state_by_ordinal[task.ordinal]["status"] = "running"
+                    state_by_ordinal[task.ordinal]["attempt"] = 1
+                    futures[executor.submit(_compute_factor, task, context)] = task
+                try:
+                    for future in as_completed(futures):
+                        task = futures[future]
+                        current_unit = task.unit_name
+                        outcome = future.result()
+                        results_by_ordinal[outcome.ordinal] = outcome.result
+                        completed += 1
+                        state = state_by_ordinal[outcome.ordinal]
+                        state["status"] = "complete"
+                        state["detail"] = (
+                            f"rows={outcome.input_rows}, evaluable={outcome.evaluable_rows}"
                         )
-                    factor = factor.merge(
-                        metadata,
-                        left_on=metadata_signal_id,
-                        right_on=metadata_id,
-                        how="left",
-                        validate="many_to_one",
-                    )
-                if scope == "within_theme":
-                    prepared = _prepare_within_factor(
-                        factor,
-                        score_column=score_column,
-                        control_columns=control_columns,
-                        min_theme_size=min_theme_size,
-                    )
-                    eval_score = "scope_score"
-                    eval_target = "scope_target_return"
-                    eval_symbol = symbol_column
-                    eval_min_cross_section = int(min_cross_section)
-                    eval_slices = slice_columns
-                    eval_controls: Iterable[str] = ()
-                elif scope == "inter_theme":
-                    prepared = _prepare_inter_factor(
-                        factor,
-                        score_column=score_column,
-                        control_columns=control_columns,
-                        min_theme_cross_section=min_theme_cross_section,
-                        min_theme_size=min_theme_size,
-                    )
-                    eval_score = "scope_score"
-                    eval_target = "scope_target_return"
-                    eval_symbol = "symbol_id"
-                    eval_min_cross_section = int(min_theme_cross_section)
-                    eval_slices = []
-                    eval_controls = ()
-                else:
-                    prepared = factor
-                    eval_score = score_column
-                    eval_target = "target_return"
-                    eval_symbol = symbol_column
-                    eval_min_cross_section = int(min_cross_section)
-                    eval_slices = slice_columns
-                    eval_controls = control_columns
-                evaluable_rows = int(len(prepared))
-                if prepared.empty and scope in SCOPE_ALPHA_SEMANTICS:
-                    result = _insufficient_factor_result(
-                        factor_row,
-                        factor_keys=factor_keys,
-                        scope=scope,
-                        pit_audit=pit_audit.as_dict(),
-                        label_contract=label_contract,
-                        reason=(
-                            "insufficient_within_theme_members"
-                            if scope == "within_theme"
-                            else "insufficient_inter_theme_cross_section"
-                        ),
-                        input_rows=input_rows,
-                        evaluable_rows=0,
-                        symbol_count=symbol_count,
-                    )
-                elif prepared.empty:
-                    result = AlphaResult(
-                        metrics=pd.DataFrame(),
-                        ic_series=pd.DataFrame(),
-                        daily_ic=pd.DataFrame(),
-                        quantile_returns=pd.DataFrame(),
-                        portfolio_returns=pd.DataFrame(),
-                        stability=pd.DataFrame(),
-                        score_correlation=pd.DataFrame(),
-                        governance=governance,
-                    )
-                else:
-                    result = evaluate_alpha(
-                        prepared,
-                        score_column=eval_score,
-                        label_column=eval_target,
-                        time_column="decision_time",
-                        symbol_column=eval_symbol,
-                        trade_date_column="trade_date",
-                        quantiles=quantiles,
-                        annualization_factor=annualization_factor,
-                        min_cross_section=eval_min_cross_section,
-                        slice_columns=eval_slices,
-                        direction_column=direction_column,
-                        default_direction=default_direction,
-                        control_columns=eval_controls,
-                        label_overlapping=label_contract.overlapping,
-                        governance=governance,
-                    )
-                    if scope in SCOPE_ALPHA_SEMANTICS:
-                        for frame in (
-                            result.metrics,
-                            result.ic_series,
-                            result.daily_ic,
-                            result.quantile_returns,
-                            result.portfolio_returns,
-                            result.stability,
-                        ):
-                            if not frame.empty:
-                                frame["scope_alpha_unit"] = SCOPE_ALPHA_SEMANTICS[scope]
-                        if not result.metrics.empty:
-                            result.metrics["scope"] = scope
-                            result.metrics["scope_input_rows"] = input_rows
-                            result.metrics["scope_evaluable_rows"] = evaluable_rows
-                            result.metrics["scope_drop_reason"] = None
-                            result.metrics["inter_theme_cost_semantics"] = (
-                                "theme_portfolio_notional"
-                                if scope == "inter_theme"
-                                else "stock_turnover"
-                            )
-            frames = _result_frames(result)
-            commit_frames(
-                unit_dir,
-                checkpoint_spec,
-                {
-                    name: _checkpoint_frame(frame)
-                    for name, frame in frames.items()
-                },
-                metadata={
-                    "ordinal": ordinal,
-                    "scope": scope,
-                    "factor_identity": identity,
-                    "input_rows": input_rows,
-                },
+                        write_progress(
+                            checkpoint_root,
+                            stage=f"dual-theme-{scope}-factor-checkpoints",
+                            total=total,
+                            completed=completed,
+                            reused=reused,
+                            current=current_unit,
+                            units=unit_states,
+                            extra={"factor_worker_plan": worker_plan.as_dict()},
+                        )
+                except Exception:
+                    failed += 1
+                    failed_task = futures.get(future) if "future" in locals() else None
+                    if failed_task is not None:
+                        state_by_ordinal[failed_task.ordinal]["status"] = "failed"
+                    for pending_future in futures:
+                        pending_future.cancel()
+                    raise
+        ordered_results = [
+            results_by_ordinal[ordinal]
+            for ordinal in sorted(results_by_ordinal)
+        ]
+        if len(ordered_results) != total:
+            raise RuntimeError(
+                f"Scope {scope} restored/computed {len(ordered_results)} factors; expected {total}"
             )
-            results.append(result)
-            completed += 1
-            state["status"] = "complete"
-            write_progress(
-                checkpoint_root,
-                stage=f"dual-theme-{scope}-factor-checkpoints",
-                total=total,
-                completed=completed,
-                reused=reused,
-                current=unit_name,
-                units=unit_states,
-            )
-            del factor, result
-            if "prepared" in locals():
-                del prepared
-            gc.collect()
         combined = combine_alpha_results(
-            results,
+            ordered_results,
             governance={
                 **governance,
                 "factor_count": total,
                 "factor_checkpoint_count": total,
                 "factor_checkpoint_reused": reused,
-                "streaming_mode": "factor_sequential_duckdb_checkpointed",
+                "factor_workers_requested": int(factor_workers),
+                "factor_workers_used": worker_plan.workers,
+                "streaming_mode": "factor_parallel_duckdb_checkpointed",
                 "resource_budget": resource_budget.as_dict(),
             },
         )
@@ -580,7 +799,10 @@ def _evaluate_scope_checkpointed(
             current=None,
             status="complete",
             units=unit_states,
-            extra={"checkpoint_contract_hash": checkpoint_contract_hash},
+            extra={
+                "checkpoint_contract_hash": checkpoint_contract_hash,
+                "factor_worker_plan": worker_plan.as_dict(),
+            },
         )
         return combined
     except Exception as exc:
@@ -590,11 +812,18 @@ def _evaluate_scope_checkpointed(
             total=int(len(locals().get("factors", []))),
             completed=int(locals().get("completed", 0)),
             reused=int(locals().get("reused", 0)),
-            failed=1,
-            current=locals().get("unit_name"),
+            failed=max(1, int(locals().get("failed", 0))),
+            current=locals().get("current_unit"),
             status="failed",
             units=locals().get("unit_states", []),
-            extra={"error": repr(exc)},
+            extra={
+                "error": repr(exc),
+                "factor_worker_plan": (
+                    locals().get("worker_plan").as_dict()
+                    if locals().get("worker_plan") is not None
+                    else {"requested_workers": int(factor_workers)}
+                ),
+            },
         )
         raise
     finally:
@@ -650,8 +879,6 @@ def _legacy_horizon_compatible(
     }
     if any(parameters.get(key) != value for key, value in expected_parameters.items()):
         return False
-    # Old pinned bundles did not record these parameters. Reuse them only for the
-    # exact pinned/default execution contract used by the July campaign.
     if not (
         quantiles == 5
         and min_cross_section == 100
@@ -663,6 +890,7 @@ def _legacy_horizon_compatible(
         and correlation_sample_modulus == 0
     ):
         return False
+
     def normalized(records: Iterable[dict[str, object]]) -> set[tuple[str, int, str]]:
         return {
             (
@@ -673,6 +901,7 @@ def _legacy_horizon_compatible(
             for record in records
             if isinstance(record, dict)
         }
+
     if normalized(run_manifest.get("inputs", [])) != normalized(manifest_inputs):
         return False
     try:
@@ -747,6 +976,62 @@ def _write_horizon_checkpoint(
     )
 
 
+def _checkpoint_contract_hash(
+    *,
+    horizon_name: str,
+    contract: LabelContract,
+    expected_factors: int,
+    manifest_inputs: list[dict[str, object]],
+    join_keys: list[str],
+    score_column: str,
+    symbol_column: str,
+    quantiles: int,
+    min_cross_section: int,
+    control_columns: list[str],
+    min_theme_size: int,
+    min_theme_cross_section: int,
+    direction_column: str | None,
+    default_direction: str,
+    annualization_factor: float | None,
+    correlation_sample_modulus: int,
+) -> str:
+    # Worker count, thread count, memory and spill path are execution choices and
+    # intentionally do not invalidate mathematically equivalent factor checkpoints.
+    normalized_inputs = [
+        {
+            "path": str(record.get("path")),
+            "size_bytes": int(record.get("size_bytes", -1)),
+            "sha256": str(record.get("sha256")),
+        }
+        for record in manifest_inputs
+    ]
+    return sha256_json(
+        {
+            "version": DUAL_THEME_ALPHA_VERSION,
+            "horizon": horizon_name,
+            "label_contract": contract.as_dict(),
+            "expected_factors": int(expected_factors),
+            "inputs": normalized_inputs,
+            "join_keys": join_keys,
+            "score_column": score_column,
+            "symbol_column": symbol_column,
+            "quantiles": int(quantiles),
+            "min_cross_section": int(min_cross_section),
+            "control_columns": control_columns,
+            "min_theme_size": int(min_theme_size),
+            "min_theme_cross_section": int(min_theme_cross_section),
+            "direction_column": direction_column,
+            "default_direction": default_direction,
+            "annualization_factor": annualization_factor,
+            "correlation_sample_modulus": int(correlation_sample_modulus),
+            "scope_semantics": {
+                "global": "stock_global_cross_section",
+                **SCOPE_ALPHA_SEMANTICS,
+            },
+        }
+    )
+
+
 def run_dual_theme_alpha_campaign(
     signals_root: str | Path,
     horizon_manifest: str | Path,
@@ -773,7 +1058,10 @@ def run_dual_theme_alpha_campaign(
     allow_legacy_signals: bool = False,
     correlation_sample_modulus: int = 1000,
     allow_partial: bool = False,
+    factor_workers: int = 4,
 ) -> Path:
+    if int(factor_workers) <= 0:
+        raise ValueError("factor_workers must be positive")
     signals = Path(signals_root).expanduser().resolve()
     output = Path(output_root).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -837,6 +1125,24 @@ def run_dual_theme_alpha_campaign(
         ]
         if metadata_file is not None:
             manifest_inputs.append(file_record(metadata_file))
+        checkpoint_contract_hash = _checkpoint_contract_hash(
+            horizon_name=spec.name,
+            contract=contract,
+            expected_factors=expected_factors,
+            manifest_inputs=manifest_inputs,
+            join_keys=join_key_list,
+            score_column=score_column,
+            symbol_column=symbol_column,
+            quantiles=quantiles,
+            min_cross_section=min_cross_section,
+            control_columns=control_column_list,
+            min_theme_size=min_theme_size,
+            min_theme_cross_section=min_theme_cross_section,
+            direction_column=direction_column,
+            default_direction=default_direction,
+            annualization_factor=annualization_factor,
+            correlation_sample_modulus=correlation_sample_modulus,
+        )
         run_manifest = implementation_manifest(
             operation="dual_theme_alpha_report",
             parameters={
@@ -865,6 +1171,8 @@ def run_dual_theme_alpha_campaign(
                 "annualization_factor": annualization_factor,
                 "correlation_sample_modulus": int(correlation_sample_modulus),
                 "checkpoint_granularity": "horizon_and_scope_factor",
+                "checkpoint_contract_hash": checkpoint_contract_hash,
+                "factor_workers": int(factor_workers),
             },
             inputs=manifest_inputs,
             resource_budget=resource_budget,
@@ -874,7 +1182,6 @@ def run_dual_theme_alpha_campaign(
             expected_commit=expected_git_commit,
             require_clean=require_clean,
         )
-        checkpoint_contract_hash = str(run_manifest["contract_hash"])
         horizon_output = output / f"horizon={spec.name}"
         reusable = _strict_horizon_compatible(
             horizon_output,
@@ -959,6 +1266,7 @@ def run_dual_theme_alpha_campaign(
                     correlation_sample_modulus=(
                         correlation_sample_modulus if scope == "global" else 0
                     ),
+                    factor_workers=factor_workers,
                 )
             )
         if not components:
@@ -975,6 +1283,7 @@ def run_dual_theme_alpha_campaign(
                 "component_count": len(components),
                 "checkpoint_granularity": "horizon_and_scope_factor",
                 "checkpoint_contract_hash": checkpoint_contract_hash,
+                "factor_workers": int(factor_workers),
             },
         )
         result = _annotate_result(result, spec.name, contract)
@@ -1109,6 +1418,7 @@ def run_dual_theme_alpha_campaign(
         "direct_return_metric_rows": int(len(direct_return)),
         "regime_candidate_metric_rows": int(len(regime_candidates)),
         "checkpoint_granularity": "horizon_and_scope_factor",
+        "factor_workers": int(factor_workers),
         "scope_alpha_contract": {
             "global": "stock_global_cross_section",
             **SCOPE_ALPHA_SEMANTICS,
@@ -1132,8 +1442,11 @@ def run_dual_theme_alpha_campaign(
         f"- Export contract: `{export_version}`",
         f"- Expected factor identities per horizon: {expected_factors}",
         f"- Horizons: {', '.join(spec.name for spec in horizon_specs)}",
+        f"- Factor workers requested per scope: {int(factor_workers)}",
         "- Checkpoint granularity: completed horizon bundle, then scope × factor.",
-        "- A restart reuses validated factor Parquet checkpoints and recomputes pooled FDR/governance gates.",
+        "- Factors run concurrently with independent DuckDB connections and atomic checkpoints.",
+        "- Total memory and thread budgets are divided across active factor workers.",
+        "- A restart reuses validated factor checkpoints and recomputes pooled FDR/governance gates.",
         "- Global Alpha: stock-level market-wide cross-section.",
         "- Within-Theme Alpha: theme-neutral stock selection.",
         "- Inter-Theme Alpha: membership-weighted theme portfolio allocation.",
