@@ -13,7 +13,7 @@ authors = [{name = "pttangent"}]
 dependencies = [
   "duckdb>=1.1,<2",
   "numpy>=1.26,<3",
-  "pandas>=2.2,<4",
+  "pandas>=2.2,<3",
   "pyarrow>=17,<24",
   "psutil>=6,<8",
   "scipy>=1.13,<2",
