@@ -24,6 +24,12 @@ class LabelContract:
     rebalance_minutes: int | None = None
     horizon_tolerance_seconds: int = 60
     require_entry_after_decision: bool = True
+    horizon_unit: str = "minutes"
+    entry_session_offset: int | None = None
+    exit_session_offset: int | None = None
+    entry_point: str | None = None
+    exit_point: str | None = None
+    tail_policy: str = "strict"
 
     def validate(self) -> None:
         if not self.label_id.strip():
@@ -36,13 +42,61 @@ class LabelContract:
             raise ValueError("rebalance_minutes must be positive when supplied")
         if self.horizon_tolerance_seconds < 0:
             raise ValueError("horizon_tolerance_seconds must be non-negative")
+        if self.horizon_unit not in {"minutes", "trading_sessions"}:
+            raise ValueError(
+                "horizon_unit must be 'minutes' or 'trading_sessions'"
+            )
+        if self.tail_policy not in {"strict", "allow_truncated_tail"}:
+            raise ValueError(
+                "tail_policy must be 'strict' or 'allow_truncated_tail'"
+            )
+        if self.horizon_unit == "trading_sessions":
+            if self.entry_session_offset is None or self.exit_session_offset is None:
+                raise ValueError(
+                    "Trading-session labels require entry_session_offset and "
+                    "exit_session_offset"
+                )
+            if self.entry_session_offset < 0 or self.exit_session_offset < 0:
+                raise ValueError("Trading-session offsets must be non-negative")
+            if self.exit_session_offset < self.entry_session_offset:
+                raise ValueError(
+                    "exit_session_offset must be >= entry_session_offset"
+                )
 
     def as_dict(self) -> dict[str, object]:
-        return asdict(self)
+        payload = asdict(self)
+        # Preserve the exact legacy minute-contract payload and hash. The new
+        # session fields are emitted only when they carry non-default meaning.
+        if (
+            self.horizon_unit == "minutes"
+            and self.entry_session_offset is None
+            and self.exit_session_offset is None
+            and self.entry_point is None
+            and self.exit_point is None
+            and self.tail_policy == "strict"
+        ):
+            for key in (
+                "horizon_unit",
+                "entry_session_offset",
+                "exit_session_offset",
+                "entry_point",
+                "exit_point",
+                "tail_policy",
+            ):
+                payload.pop(key, None)
+        return payload
 
     @property
     def contract_hash(self) -> str:
         return sha256_json(self.as_dict())
+
+    @property
+    def horizon_sessions(self) -> int | None:
+        if self.horizon_unit != "trading_sessions":
+            return None
+        if self.entry_session_offset is None or self.exit_session_offset is None:
+            return None
+        return int(self.exit_session_offset - self.entry_session_offset)
 
     @classmethod
     def from_json(cls, path: str | Path) -> "LabelContract":
@@ -82,8 +136,11 @@ class PitAudit:
         return {**asdict(self), "passed": self.passed}
 
 
-def required_label_columns(contract: LabelContract, join_keys: Iterable[str]) -> set[str]:
-    return {
+def required_label_columns(
+    contract: LabelContract,
+    join_keys: Iterable[str],
+) -> set[str]:
+    required = {
         *join_keys,
         "label_id",
         contract.target_column,
@@ -92,6 +149,33 @@ def required_label_columns(contract: LabelContract, join_keys: Iterable[str]) ->
         contract.exit_time_column,
         contract.available_time_column,
     }
+    if contract.horizon_unit == "trading_sessions":
+        required.update({"entry_session_offset", "exit_session_offset"})
+        if contract.entry_point is not None:
+            required.add("entry_point")
+        if contract.exit_point is not None:
+            required.add("exit_point")
+    return required
+
+
+def _trading_session_horizon_mismatch(
+    selected: pd.DataFrame,
+    contract: LabelContract,
+) -> int:
+    entry_offset = pd.to_numeric(
+        selected["entry_session_offset"], errors="coerce"
+    )
+    exit_offset = pd.to_numeric(
+        selected["exit_session_offset"], errors="coerce"
+    )
+    bad = entry_offset.isna() | exit_offset.isna()
+    bad |= entry_offset != int(contract.entry_session_offset or 0)
+    bad |= exit_offset != int(contract.exit_session_offset or 0)
+    if contract.entry_point is not None:
+        bad |= selected["entry_point"].astype(str) != str(contract.entry_point)
+    if contract.exit_point is not None:
+        bad |= selected["exit_point"].astype(str) != str(contract.exit_point)
+    return int(bad.fillna(True).sum())
 
 
 def validate_label_frame(
@@ -127,11 +211,19 @@ def validate_label_frame(
         entry_bad = int((entry < decision).fillna(True).sum())
     exit_bad = int((exit_time <= entry).fillna(True).sum())
     available_bad = int((available < exit_time).fillna(True).sum())
-    actual_seconds = (exit_time - entry).dt.total_seconds()
-    expected_seconds = float(contract.horizon_minutes * 60)
-    horizon_bad = int(
-        ((actual_seconds - expected_seconds).abs() > contract.horizon_tolerance_seconds).fillna(True).sum()
-    )
+    if contract.horizon_unit == "trading_sessions":
+        horizon_bad = _trading_session_horizon_mismatch(selected, contract)
+    else:
+        actual_seconds = (exit_time - entry).dt.total_seconds()
+        expected_seconds = float(contract.horizon_minutes * 60)
+        horizon_bad = int(
+            (
+                (actual_seconds - expected_seconds).abs()
+                > contract.horizon_tolerance_seconds
+            )
+            .fillna(True)
+            .sum()
+        )
     return PitAudit(
         signal_rows=0,
         signal_available_time_missing=0,
@@ -157,7 +249,8 @@ def validate_signal_frame(
     if available_time_column not in signals.columns:
         if strict:
             raise ValueError(
-                f"Signal frame is missing {available_time_column!r}; use an explicit legacy override only for non-governed research"
+                f"Signal frame is missing {available_time_column!r}; use an "
+                "explicit legacy override only for non-governed research"
             )
         return PitAudit(
             signal_rows=int(len(signals)),
