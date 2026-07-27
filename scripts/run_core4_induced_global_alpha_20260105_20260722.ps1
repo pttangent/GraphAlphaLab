@@ -8,15 +8,20 @@ param(
 
     [string]$SignalsOutput = "D:\DEV\AnotherNetworkFactory\warehouses\GAL_warehouse\signals\c4_260105_260722_induced_v2",
     [string]$ReportOutput = "D:\DEV\AnotherNetworkFactory\warehouses\GAL_warehouse\reports\c4_260105_260722_induced_v2",
+    [string]$FrequencyOutput = "",
     [string]$Metadata,
     [string]$ExpectedCommit = "auto",
     [int]$MemoryLimitGb = 64,
     [int]$Threads = 12,
     [int]$FactorWorkers = 6,
+    [int]$FrequencyWorkers = 6,
+    [int]$CandidatesPerHorizon = 12,
+    [int]$MinCandidateDates = 20,
     [string]$TempDirectory = "D:\GAL\duckdb_tmp\c4_260105_260722_induced_v2",
     [int]$MinCrossSection = 100,
     [int]$MinThemeSize = 5,
     [int]$MinThemeCrossSection = 5,
+    [switch]$SkipFrequency,
     [switch]$SkipInstall,
     [switch]$SkipTests,
     [switch]$SkipCleanCheck
@@ -50,6 +55,12 @@ Require-Path (Join-Path $GffCampaignRoot "gal_interface") "GFF GAL interface"
 Require-Path $HorizonManifest "horizon manifest"
 if ($Metadata) { Require-Path $Metadata "metadata" }
 if ($FactorWorkers -lt 1) { throw "FactorWorkers must be >= 1" }
+if ($FrequencyWorkers -lt 1) { throw "FrequencyWorkers must be >= 1" }
+if ($CandidatesPerHorizon -lt 1) { throw "CandidatesPerHorizon must be >= 1" }
+if ($MinCandidateDates -lt 1) { throw "MinCandidateDates must be >= 1" }
+if (-not $FrequencyOutput) {
+    $FrequencyOutput = Join-Path $ReportOutput "execution_frequency"
+}
 
 Push-Location $RepoRoot
 try {
@@ -152,6 +163,41 @@ try {
       --report-root $ReportOutput
     Assert-LastExitCode "induced-global semantic report annotation"
 
+    if (-not $SkipFrequency) {
+        New-Item -ItemType Directory -Force -Path $FrequencyOutput | Out-Null
+        $CandidateManifest = Join-Path $FrequencyOutput "execution_candidates.json"
+        $CandidateTable = Join-Path $FrequencyOutput "execution_candidates.csv"
+        $FrequencyTemp = Join-Path $TempDirectory "execution_frequency"
+        New-Item -ItemType Directory -Force -Path $FrequencyTemp | Out-Null
+
+        python scripts/select_dual_theme_frequency_candidates.py `
+          --metrics (Join-Path $ReportOutput "direct_return_alpha_metrics.csv") `
+          --output $CandidateManifest `
+          --table-output $CandidateTable `
+          --min-date-count $MinCandidateDates `
+          --max-per-horizon $CandidatesPerHorizon `
+          --min-per-horizon 2 `
+          --scopes "global,within_theme,inter_theme"
+        Assert-LastExitCode "execution candidate selection"
+
+        python scripts/run_dual_theme_frequency_dag.py `
+          --signals-root $SignalsOutput `
+          --horizon-manifest $HorizonManifest `
+          --candidate-manifest $CandidateManifest `
+          --output $FrequencyOutput `
+          --workers $FrequencyWorkers `
+          --memory-limit-gb $MemoryLimitGb `
+          --threads $Threads `
+          --temp-directory $FrequencyTemp `
+          --min-theme-size $MinThemeSize `
+          --min-theme-cross-section $MinThemeCrossSection `
+          --min-direction-train-dates 20 `
+          --direction-rolling-dates 60 `
+          --control-columns "own_score" `
+          --quantiles 5
+        Assert-LastExitCode "execution frequency global DAG"
+    }
+
     foreach ($Path in @(
         (Join-Path $SignalsOutput "_SUCCESS"),
         (Join-Path $SignalsOutput "export_manifest.json"),
@@ -168,6 +214,23 @@ try {
         Require-Path $Path "governed GAL output"
     }
 
+    if (-not $SkipFrequency) {
+        foreach ($Path in @(
+            (Join-Path $FrequencyOutput "_SUCCESS"),
+            (Join-Path $FrequencyOutput "summary.json"),
+            (Join-Path $FrequencyOutput "execution_candidates.json"),
+            (Join-Path $FrequencyOutput "frequency_policy_metrics.csv"),
+            (Join-Path $FrequencyOutput "frequency_policy_returns.csv"),
+            (Join-Path $FrequencyOutput "frequency_pareto_frontier.csv"),
+            (Join-Path $FrequencyOutput "gate_effectiveness.csv"),
+            (Join-Path $FrequencyOutput "frequency_horizon_matrix.csv"),
+            (Join-Path $FrequencyOutput "candidate_execution_recommendations.csv"),
+            (Join-Path $FrequencyOutput "_checkpoints\execution_frequency\global_dag_progress.json")
+        )) {
+            Require-Path $Path "governed execution-frequency output"
+        }
+    }
+
     Write-Host ""
     Write-Host "=== CORE4 INDUCED-GLOBAL GAL PASS ==="
     Write-Host "GAL branch: $ExpectedBranch"
@@ -177,9 +240,13 @@ try {
     Write-Host "Campaign ID: $ExpectedCampaignId"
     Write-Host "Graph semantics: Global estimate; Within is induced same-theme edge selection."
     Write-Host "Ranking semantics: Within uses local rank in decision_time x context_theme_id."
-    Write-Host "Factor workers: $FactorWorkers"
+    Write-Host "Alpha factor workers: $FactorWorkers"
     Write-Host "Reports: $ReportOutput"
-    Write-Host "Frequency candidate runner: scripts/run_dual_theme_frequency_candidate.py"
+    if (-not $SkipFrequency) {
+        Write-Host "Execution frequency workers: $FrequencyWorkers"
+        Write-Host "Candidates per horizon: up to $CandidatesPerHorizon"
+        Write-Host "Execution frequency reports: $FrequencyOutput"
+    }
 }
 finally {
     Pop-Location
