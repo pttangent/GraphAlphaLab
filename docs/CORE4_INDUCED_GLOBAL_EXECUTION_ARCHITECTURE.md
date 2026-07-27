@@ -1,60 +1,53 @@
-# GraphAlphaLab next architecture: induced-global graph, local execution, frequency gates
+# Core4 induced-global execution architecture
 
-## 1. Correct computation identity
-
-The supported GraphFactorFactory_v2 source is:
+## 1. Governed source identity
 
 ```text
-repository: pttangent/GraphFactorFactory_v2
-branch: agent/core4-batched-halfyear
-entrypoint: scripts/run_core4_20260105_20260722.ps1
-campaign id: c4_260105_260722_induced_v2
-campaign root: D:\G4H\campaign=c4_260105_260722_induced_v2
-research cache: D:\G4C
-GFF campaign version: SMI_DUAL_THEME_IGC_FULL_SCOPE_COMPARE_V2_INDUCED_WITHIN
+GFF repository: pttangent/GraphFactorFactory_v2
+GFF branch: agent/core4-batched-halfyear
+GFF entrypoint: scripts/run_core4_20260105_20260722.ps1
+GFF campaign: D:\G4H\campaign=c4_260105_260722_induced_v2
+GFF version: SMI_DUAL_THEME_IGC_FULL_SCOPE_COMPARE_V2_INDUCED_WITHIN
+GAL branch: agent/induced-global-frequency-gates
 ```
 
-The version name contains `INDUCED_WITHIN`, but its actual estimator semantics are:
+The GFF `within_theme` scope is not a locally re-estimated graph. Its governed computation is:
 
 ```text
 Global IGC estimator
 -> governed Global final edges
--> same-theme edge filter using context_theme_id
+-> same-theme edge selection by context_theme_id
 -> induced graph partition
 -> P1 rebuilt from the induced edge graph
 ```
 
-It does **not** perform:
+It does not perform local residualization, local candidate generation, local lag selection, local Top-K competition, local degree-cap competition, or Local CUDA estimation.
+
+GAL uses the following unambiguous names:
+
+| GFF scope | Graph estimator | GAL ranking | Canonical GAL name |
+|---|---|---|---|
+| global | Global market | Global stock cross-section | `global_graph_global_rank` |
+| within_theme | Global market, same-theme induced edges | Local rank inside `decision_time × context_theme_id` | `induced_global_graph_local_rank` |
+| inter_theme | Global market, cross-theme aggregation | Rank across theme portfolios | `global_graph_inter_theme_rank` |
+
+## 2. End-to-end architecture
 
 ```text
-local residualization
-local candidate generation
-local lag selection
-local Top-K / degree-cap competition
-local CUDA estimation
+GFF outputs
+  -> Core4 compatibility and scope-semantics audit
+  -> governed GAL signal export
+  -> all-factor discovery Alpha, six-worker global DAG
+  -> matched graph-forward candidate selection
+  -> candidate × horizon execution-frequency DAG
+  -> frequency, gate, turnover, cost and Pareto reports
 ```
 
-Therefore GAL must use these names:
+Frequency research never recomputes GFF. It keeps the factor, return horizon and universe fixed and changes only the execution policy.
 
-| GFF scope | Graph estimation | Scope operation | GAL ranking | Canonical GAL name |
-|---|---|---|---|---|
-| global | Global market | none | Global stock rank | `global_graph_global_rank` |
-| within_theme | Global market | same-theme induced Global final edges | Local rank inside `decision_time × context_theme_id` | `induced_global_graph_local_rank` |
-| inter_theme | Global market | aggregate Global edges/scores into theme portfolios | Rank across themes | `global_graph_inter_theme_rank` |
+## 3. GFF compatibility audit
 
-`within_theme` must never be described as a locally estimated graph. It is a Global graph with theme-scoped edge selection and Local execution ranking.
-
-## 2. GFF compatibility contract
-
-Before export, GAL runs:
-
-```powershell
-python scripts/audit_core4_gff_compatibility.py `
-  --gff-campaign-root "D:\G4H\campaign=c4_260105_260722_induced_v2" `
-  --output "D:\GAL\audits\c4_260105_260722_induced_v2.json"
-```
-
-The audit requires:
+Before export, GAL requires:
 
 ```text
 campaign _SUCCESS
@@ -70,203 +63,132 @@ Residual Within / Inter = 20 / 20
 complete partition inventory
 ```
 
-The GFF `gal_interface` may still expose the legacy generic label `theme_local`. GAL treats that label as non-authoritative and resolves estimator semantics from `campaign_contract.json`.
+The generic GFF interface label `theme_local` is non-authoritative. GAL resolves estimator provenance from `campaign_contract.json`.
 
-## 3. Research architecture
+## 4. Candidate selection
+
+Execution research is not run over all discovery rows. `execution_candidates.py` matches, within the same factor/scope/horizon identity:
 
 ```text
-GFF graph outputs
-  |
-  +-- GAL semantic input audit
-  |
-  +-- governed signal export
-  |     +-- Global graph score
-  |     +-- induced-global same-theme score
-  |     +-- Inter-Theme aggregate score
-  |
-  +-- discovery Alpha
-  |     +-- IC and falsification
-  |     +-- node baseline
-  |     +-- reverse-edge placebo
-  |     +-- direct-return vs regime semantics
-  |
-  +-- candidate shortlist
-  |
-  +-- execution-frequency laboratory
-        +-- same factor
-        +-- same horizon
-        +-- same universe
-        +-- PIT-safe walk-forward direction
-        +-- different rebalance frequency and gates only
+graph_forward
+node_baseline
+graph_reverse_placebo
 ```
 
-Frequency research is deliberately separated from GFF. No graph or theme is recomputed.
-
-## 4. Do not confuse horizon and trading frequency
-
-A 180-minute return label does not imply that the portfolio must rebalance every 180 minutes. The next GAL report must form a matrix:
+Eligible inputs are graph-forward direct-return factors with sufficient dates. Ranking combines:
 
 ```text
-rows    = signal factor and scale
-columns = return horizon × execution policy
+absolute IC increment vs node baseline
+absolute IC increment vs reverse-edge placebo
+graph absolute IC
+daily IC sign consistency
+gross return per unit turnover
+ICIR
 ```
 
-For every fixed factor and fixed horizon, compare:
+Candidates are labelled:
 
 ```text
-5m, 15m, 30m, 60m, 120m, 180m fixed rebalance
-rank-change gate
-confidence gate
-theme-stability gate
-combined gate with turnover cap
+strict_incremental: graph abs-IC exceeds both matched controls
+exploratory: retained only to satisfy an explicit per-horizon research floor
 ```
 
-This isolates the effect of trading frequency. Comparing a 5m horizon strategy with a 180m horizon strategy is not a valid frequency experiment because both label and execution change.
+The default full campaign selects at most 12 candidates per horizon and requires at least 20 dates.
 
-## 5. Gate factors that reduce unnecessary trading
+## 5. Execution policy grid
 
-### 5.1 Rank-change gate
-
-Rebalance only when the current score ranking has materially changed from the previous executed ranking.
+For every fixed candidate and fixed return horizon, GAL compares:
 
 ```text
-rank_change = 1 - Spearman(previous_rank, current_rank)
+fixed rebalance: 5m, 15m, 30m, 60m, 120m, 180m
+rank-change gates: 15m, 30m, 60m, 120m
+past-only confidence gates: 15m, 30m, 60m, 120m
+combined gates with turnover caps: 15m, 30m, 60m, 120m
+theme-stability gates: 30m, 60m, 120m
 ```
 
-Default research threshold: `rank_change >= 0.25`.
-
-Use case: signals update every five minutes but the selected long/short names remain nearly identical.
-
-### 5.2 Confidence gate
-
-Use the cross-sectional score dispersion as a real-time confidence proxy:
+Default gate definitions:
 
 ```text
-score_dispersion = score_p90 - score_p10
-```
-
-Rebalance only when current dispersion exceeds a quantile calculated from **past observations only**. Default research quantile: 60%.
-
-Use case: avoid paying turnover when graph scores are compressed and do not separate names/themes.
-
-### 5.3 Minimum target-turnover gate
-
-If the newly calculated target differs only slightly from current positions, keep the old book.
-
-Default research threshold:
-
-```text
-candidate target turnover >= 0.10
-```
-
-This is a no-trade band, not a performance gate.
-
-### 5.4 Theme-stability gate
-
-For Within-Theme and Inter-Theme execution, compare the current `symbol -> context_theme_id` mapping with the prior executed mapping.
-
-```text
-retention = unchanged theme assignments / common symbols
-```
-
-Default research threshold: 70%.
-
-Use case: do not rebalance aggressively while P1 membership is undergoing a split, merge or unstable remapping.
-
-### 5.5 Turnover cap
-
-When the target book requires a large change, blend gradually from the current book toward the target.
-
-Default research cap:
-
-```text
+rank_change = 1 - Spearman(previous executed rank, current rank)
+score_dispersion = score P90 - score P10
+confidence threshold = rolling past-only 60th percentile
+theme_retention = unchanged theme assignments / common symbols
+minimum target turnover = 0.10
 maximum traded notional per rebalance = 0.50
 ```
 
-This prevents a single theme transition from producing an almost complete portfolio replacement.
+The first 20 dates are warm-up. Direction for each later date is inferred only from previous dates, using at most the previous 60 dates. Discovery `default_direction=auto` is not reused as an execution direction.
 
-### 5.6 Risk/liquidity regime gates
+Execution state resets at each trading session by default. Intraday positions are not silently carried overnight. `--carry-overnight` exists only as an explicit diagnostic override.
 
-The strongest non-return GFF layers should not be promoted directly to return Alpha. They become execution gates:
+## 6. Global DAG and checkpoint contract
+
+The production execution unit is:
 
 ```text
-trade_intensity_to_volatility
-flow_to_volatility
-liquidity_to_volatility
-burst_to_liquidity
-venue_fragmentation_to_price_impact
+candidate factor × return horizon
 ```
 
-Next implementation stage:
+Each worker loads and prepares the candidate once, then evaluates the complete policy grid. All horizons and scopes share one ready queue. There is no horizon barrier and no scope barrier.
+
+Default resources:
 
 ```text
-base direct-return Alpha
-× risk/liquidity regime state
--> gross exposure, rebalance permission, turnover budget and holding period
+workers = 6
+memory = 64 GB total, split across workers
+threads = 12 total, split across workers
+max inflight = 2 × workers
 ```
 
-These gates must be estimated from information available at the decision time and tested out of sample.
-
-## 6. Direction governance
-
-The old `default_direction=auto` uses the same sample to choose long-high or long-low. It is allowed only as a discovery diagnostic.
-
-Execution-frequency reports use:
+Checkpoint path:
 
 ```text
-predeclared financial direction
-or
-walk-forward daily direction based only on prior dates
+<FrequencyOutput>\_checkpoints\execution_frequency\
+  horizon=<h>\scope=<scope>\candidate-<contract-hash>\
 ```
 
-Default walk-forward rule:
+Each candidate checkpoint contains:
 
 ```text
-minimum training dates = 20
-rolling training window = 60 dates
+metrics.parquet
+daily_returns.parquet
+decision_returns.parquet
+frontier.parquet
+gate_effectiveness.parquet
+checkpoint.json
 ```
 
-The first 20 dates are training-only and produce no executed results.
+Checkpoint identity includes candidate identity, label contract, policy grid, preparation thresholds, direction rules, quantiles and overnight policy. Worker count, memory and threads are execution choices and do not change the mathematical identity.
 
-## 7. Candidate-first computation
-
-Do not rerun frequency policies for all 1,908 factor-horizon rows immediately.
-
-Recommended DAG:
+Progress files:
 
 ```text
-Stage A: existing discovery Alpha over all factors
-Stage B: shortlist graph-forward direct-return factors
-Stage C: candidate × horizon × execution policy
-Stage D: policy Pareto frontier and gate attribution
+<FrequencyOutput>\_checkpoints\execution_frequency\global_dag_progress.json
+<FrequencyOutput>\_checkpoints\execution_frequency\progress.json
+<FrequencyOutput>\_checkpoints\execution_frequency\DASHBOARD.md
 ```
 
-Initial shortlist rule:
+## 7. PIT and schema audit
+
+Every candidate task checks:
 
 ```text
-graph_forward only
-direct_return_alpha only
-matched node/placebo data available
-at least 20 dates
-rank by:
-  graph abs-IC increment vs node
-  graph abs-IC increment vs reverse placebo
-  gross spread
-  sign consistency
-  stability across dates
+signal_available_time exists
+signal_available_time <= decision_time
+entry_time is after decision_time according to the label contract
+exit_time > entry_time
+actual horizon matches the label contract
+candidate horizon matches the horizon manifest
 ```
 
-Frequency evaluation is then parallelized at:
+Global, induced-global/local-rank and Inter-Theme preparation reuse the same GAL calculation principles as the discovery Alpha path.
+
+## 8. Output bundle
 
 ```text
-candidate factor × horizon
-```
-
-Each worker evaluates the full policy grid for one candidate/horizon so prepared data is loaded only once.
-
-## 8. Required output tables
-
-```text
+execution_candidates.json
+execution_candidates.csv
 scope_semantics.json
 frequency_policy_metrics.csv
 frequency_policy_returns.csv
@@ -274,87 +196,70 @@ frequency_pareto_frontier.csv
 gate_effectiveness.csv
 frequency_horizon_matrix.csv
 candidate_execution_recommendations.csv
+decision_returns_catalog.csv
+summary.json
+REPORT.md
+_SUCCESS
 ```
 
-Core metrics:
+Raw decision-level returns remain inside candidate checkpoints. `frequency_policy_returns.csv` is the compact daily aggregation.
+
+Promotion requires all of:
 
 ```text
-rebalance count and rate
-mean and total turnover
-turnover reduction vs fixed 5m
-Gross return
-Net return at 1/2/5/10 bps
-Net increment vs fixed 5m
-Daily diagnostic Sharpe
-Hit rate
-Maximum drawdown
-Rank change
-Score dispersion
-Theme retention
-Gate pass rate
-Average time between executed rebalances
+PIT-safe walk-forward direction
+same factor and horizon comparison
+positive net mean at 5 bps
+lower turnover than fixed 5m
+at least 20 evaluation dates
+membership on the return-turnover Pareto frontier
 ```
 
-## 9. Promotion rules
+Passing this rule means “promote for falsification”, not production approval.
 
-A policy is not promoted merely because it has the highest backtest return.
+## 9. Canonical run
 
-Required:
+```powershell
+cd D:\DEV\AnotherNetworkFactory\GraphAlphaLab
+
+git fetch origin --prune
+git switch agent/induced-global-frequency-gates
+git pull --ff-only origin agent/induced-global-frequency-gates
+
+.\scripts\run_core4_induced_global_alpha_20260105_20260722.ps1 `
+  -HorizonManifest "D:\GAL\contracts\dual_theme_horizons.c4_260105_260722_induced_v2.json" `
+  -Metadata "D:\GAL\metadata\symbol_metadata.with_symbol_id.parquet" `
+  -FactorWorkers 6 `
+  -FrequencyWorkers 6 `
+  -CandidatesPerHorizon 12 `
+  -MinCandidateDates 20
+```
+
+The runner performs the GFF audit, signal export, discovery Alpha DAG, semantic annotation, candidate selection and execution-frequency DAG. It validates both Alpha and frequency output bundles before reporting success.
+
+Do not use force export, partial reports or dirty-checkout bypasses for the governed run.
+
+## 10. Current boundary
+
+Implemented and CI-covered:
 
 ```text
-PIT-safe direction
-same factor/horizon matched comparison
-positive net result under approved cost assumption
-lower turnover than native frequency
-stable result across months and market regimes
-not dominated on the return-turnover Pareto frontier
-no dependence on one trading day
+induced-global semantic correction
+matched candidate selection
+candidate × horizon six-worker global DAG
+factor-level atomic execution checkpoints
+PIT-safe session-reset execution engine
+fixed-frequency and gate comparison
+cost analysis and Pareto reports
+canonical half-year runner integration
 ```
 
-For a 137-session campaign, use:
+Still requires local evidence before merging the Draft PR:
 
 ```text
-first 20 sessions: direction/gate warm-up
-remaining sessions: walk-forward evaluation
-monthly slices
-early/mid/late session slices
-high/low volatility slices
-high/low liquidity slices
+real 137-session GFF directory audit
+full local candidate × horizon execution run
+coverage waterfall for Global -> induced -> membership -> label -> evaluable rows
+monthly and time-of-day stability review
+risk/liquidity regime gates as a later execution overlay
 ```
-
-## 10. Commands
-
-Audit GFF compatibility:
-
-```powershell
-python scripts/audit_core4_gff_compatibility.py `
-  --gff-campaign-root "D:\G4H\campaign=c4_260105_260722_induced_v2" `
-  --output "D:\GAL\audits\core4_induced_global.json"
-```
-
-Create corrected semantic views after the existing Alpha report:
-
-```powershell
-python scripts/annotate_induced_global_report.py `
-  --gff-campaign-root "D:\G4H\campaign=c4_260105_260722_induced_v2" `
-  --report-root "D:\DEV\AnotherNetworkFactory\warehouses\GAL_warehouse\reports\c4_260105_260722_induced_v2"
-```
-
-Run one shortlisted factor/horizon frequency experiment:
-
-```powershell
-python scripts/run_dual_theme_frequency_candidate.py `
-  --signals-root "D:\DEV\AnotherNetworkFactory\warehouses\GAL_warehouse\signals\c4_260105_260722_induced_v2" `
-  --labels "D:\GAL\labels\forward_return_180m.parquet" `
-  --label-contract "D:\GAL\contracts\forward_return_180m.json" `
-  --output "D:\GAL\frequency\vwap_60m_to_180m" `
-  --scope inter_theme `
-  --factor-id "inter_theme::momentum_state::vwap_dislocation_to_return::graph_forward" `
-  --layer-id "vwap_dislocation_to_return" `
-  --scale-minutes 60 `
-  --variant-id graph_forward
-```
-
-## 11. Current boundary
-
-The new execution-frequency module is a candidate laboratory. The next production step is to place candidate × horizon tasks into the existing six-worker global DAG and add factor-level execution checkpoints. Until that integration is validated, the existing Alpha checkpoint contract remains unchanged.
