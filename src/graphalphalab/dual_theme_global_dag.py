@@ -278,6 +278,17 @@ def _run_factor_task(task: FactorTask) -> dict[str, object]:
             if column and column in signal_columns
         )
         select_signal = list(dict.fromkeys(select_signal))
+        # Memory diet: factor-key columns are constant within one task and
+        # label bookkeeping columns are never consumed downstream. Excluding
+        # them from the projection avoids materialising multi-GB constant
+        # string/timestamp arrays for large horizons; factor keys are
+        # re-attached as cheap categoricals after fetch.
+        constant_identity = {
+            column: task.factor_identity.get(column) for column in factor_keys
+        }
+        select_signal = [
+            column for column in select_signal if column not in constant_identity
+        ]
         signal_projection = ", ".join(
             f's."{column}"' for column in select_signal
         )
@@ -292,17 +303,18 @@ def _run_factor_task(task: FactorTask) -> dict[str, object]:
         factor = connection.execute(
             f"""
             SELECT {signal_projection},
-                   l."{contract.target_column}" AS target_return,
-                   l.label_id,
-                   l."{contract.entry_time_column}" AS entry_time,
-                   l."{contract.exit_time_column}" AS exit_time,
-                   l."{contract.available_time_column}" AS label_available_time
+                   l."{contract.target_column}" AS target_return
             FROM signals s
             JOIN labels l ON {join_expression}
             WHERE {where} AND {label_filter}
             ORDER BY s.trade_date, s.decision_time, s."{task.symbol_column}"
             """
         ).fetch_df()
+        for column, value in constant_identity.items():
+            if value is None or (not isinstance(value, str) and pd.isna(value)):
+                factor[column] = pd.Series([None] * len(factor), dtype=object)
+            else:
+                factor[column] = pd.Categorical([value] * len(factor))
         input_rows = int(len(factor))
         symbol_count = (
             int(factor[task.symbol_column].nunique())
