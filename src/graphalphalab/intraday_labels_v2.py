@@ -15,6 +15,7 @@ from .checkpoint import CheckpointSpec, checkpoint_valid, commit_frames, write_p
 from .contracts import LabelContract
 from .daily_labels_v2 import bar_files, selected_dates, sql_literal, sql_path
 from .dual_theme_common import DUAL_THEME_BATCH_ID, load_gff_campaign_contract
+from .dual_theme_resumable import stable_export_manifest_record
 from .governance import atomic_write_frame, atomic_write_json, file_record, sha256_file, sha256_json
 
 
@@ -164,7 +165,7 @@ def build_intraday_labels_v2(
         "operation": "dual_theme_intraday_labels_v1_next_bar_open",
         "code_sha256": sha256_file(Path(__file__)),
         "campaign": file_record(campaign["path"]),
-        "signals": file_record(export_manifest),
+        "signals": stable_export_manifest_record(export_manifest),
         "dates": dates,
         "specs": [{"name": spec.name, "minutes": spec.horizon_minutes} for spec in specs],
         "entry": "next exact 1-minute bar open",

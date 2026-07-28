@@ -13,6 +13,7 @@ import pandas as pd
 from .checkpoint import CheckpointSpec, checkpoint_valid, commit_frames, write_progress
 from .contracts import LabelContract
 from .dual_theme_common import DUAL_THEME_BATCH_ID, load_gff_campaign_contract
+from .dual_theme_resumable import stable_export_manifest_record
 from .governance import atomic_write_frame, atomic_write_json, file_record, sha256_file, sha256_json
 
 
@@ -247,7 +248,7 @@ def build_daily_labels_v2(
         "operation": "dual_theme_daily_labels_v4_next_open",
         "code_sha256": sha256_file(Path(__file__)),
         "campaign": file_record(campaign["path"]),
-        "signals": file_record(export_manifest),
+        "signals": stable_export_manifest_record(export_manifest),
         "dates": dates,
         "specs": [spec.__dict__ for spec in specs],
         "rth": "America/New_York 09:30-16:00",
