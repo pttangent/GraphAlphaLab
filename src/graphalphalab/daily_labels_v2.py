@@ -164,8 +164,8 @@ def build_daily_labels_v2(
     con.execute(f"""
       CREATE VIEW bars AS
       SELECT CAST(trade_date AS VARCHAR) trade_date, CAST(symbol_id AS BIGINT) symbol_id,
-             CAST(timestamp AS TIMESTAMPTZ) timestamp, CAST(available_time AS TIMESTAMPTZ) available_time,
-             CAST(open AS DOUBLE) open, CAST(close AS DOUBLE) close
+             CAST(timestamp AS TIMESTAMPTZ) "timestamp", CAST(available_time AS TIMESTAMPTZ) available_time,
+             CAST(open AS DOUBLE) "open", CAST(close AS DOUBLE) "close"
       FROM read_parquet('{sql_path(bars / 'date=*' / '*.parquet')}', union_by_name=true, hive_partitioning=false)
       WHERE CAST(trade_date AS VARCHAR) IN ({support_sql})
         AND symbol_id IS NOT NULL AND open IS NOT NULL AND close IS NOT NULL
