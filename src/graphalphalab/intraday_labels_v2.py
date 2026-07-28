@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 import json
@@ -41,6 +42,85 @@ def _contract(spec: IntradayLabelSpec) -> LabelContract:
     )
 
 
+def _intraday_chunk_worker(payload: dict) -> list[dict[str, object]]:
+    # Worker processes get their own DuckDB connection with a split resource
+    # budget. Checkpoint specs are computed from the parent-provided
+    # contract_hash, so parallel and sequential runs share checkpoints.
+    chunk = [str(value) for value in payload["dates"]]
+    specs = payload["specs"]
+    parts = Path(payload["parts"])
+    files = {str(key): [Path(value) for value in values] for key, values in payload["files"].items()}
+    contract_hash = str(payload["contract_hash"])
+    con = duckdb.connect()
+    try:
+        con.execute(f"PRAGMA threads={max(1, int(payload['threads']))}")
+        con.execute(f"SET memory_limit='{float(payload['memory_limit_gb']):g}GB'")
+        if payload.get("temp_directory"):
+            temporary_dir = Path(payload["temp_directory"]) / f"intraday-worker-{os.getpid()}"
+            temporary_dir.mkdir(parents=True, exist_ok=True)
+            con.execute(f"SET temp_directory='{sql_path(temporary_dir)}'")
+        dates_sql = ",".join(sql_literal(value) for value in chunk)
+        con.execute(f"""
+          CREATE VIEW decisions AS
+          SELECT DISTINCT CAST(trade_date AS VARCHAR) trade_date,
+                 CAST(decision_time AS TIMESTAMPTZ) decision_time, CAST(symbol_id AS BIGINT) symbol_id
+          FROM read_parquet('{payload["signal_pattern"]}', union_by_name=true, hive_partitioning=false)
+          WHERE CAST(trade_date AS VARCHAR) IN ({dates_sql})
+        """)
+        con.execute(f"""
+          CREATE VIEW bars AS
+          SELECT CAST(trade_date AS VARCHAR) trade_date, CAST(symbol_id AS BIGINT) symbol_id,
+                 CAST(timestamp AS TIMESTAMPTZ) "timestamp", CAST(available_time AS TIMESTAMPTZ) available_time,
+                 CAST(open AS DOUBLE) "open", CAST(close AS DOUBLE) "close"
+          FROM read_parquet('{payload["bars_pattern"]}', union_by_name=true, hive_partitioning=false)
+          WHERE CAST(trade_date AS VARCHAR) IN ({dates_sql})
+            AND symbol_id IS NOT NULL AND open IS NOT NULL AND close IS NOT NULL
+            AND CAST(timezone('America/New_York', timestamp) AS TIME) BETWEEN TIME '09:30:00' AND TIME '15:59:00'
+        """)
+        states: list[dict[str, object]] = []
+        for trade_date in chunk:
+            records = [file_record(path) for path in files[trade_date]]
+            checkpoint = CheckpointSpec("intraday-label-v2", trade_date, contract_hash, sha256_json(records))
+            target = parts / f"date={trade_date}"
+            state = {"unit": trade_date, "status": "pending", "attempt": 0, "detail": str(target)}
+            states.append(state)
+            if checkpoint_valid(target, checkpoint, required_files=("data.parquet",)):
+                state["status"] = "reused"
+                continue
+            queries: list[str] = []
+            for spec in specs:
+                queries.append(f"""
+                  SELECT d.trade_date,d.decision_time,d.symbol_id,{sql_literal(spec['label_id'])} label_id,
+                         entry.timestamp entry_time,exit.timestamp + INTERVAL '1 minute' exit_time,
+                         greatest(entry.available_time,exit.available_time,exit.timestamp + INTERVAL '1 minute') label_available_time,
+                         exit.close/nullif(entry.open,0)-1 target_return
+                  FROM decisions d
+                  JOIN bars entry ON entry.trade_date=d.trade_date AND entry.symbol_id=d.symbol_id
+                                 AND entry.timestamp=d.decision_time + INTERVAL '1 minute'
+                  JOIN bars exit ON exit.trade_date=d.trade_date AND exit.symbol_id=d.symbol_id
+                                AND exit.timestamp=d.decision_time + INTERVAL '{int(spec['minutes'])} minute'
+                  WHERE d.trade_date={sql_literal(trade_date)}
+                    AND entry.timestamp>d.decision_time
+                    AND exit.timestamp + INTERVAL '1 minute'>entry.timestamp
+                """)
+            temporary = target.parent / f".{target.name}.{os.getpid()}.part.parquet"
+            temporary.unlink(missing_ok=True)
+            con.execute("COPY (" + " UNION ALL ".join(queries) + f") TO '{sql_path(temporary)}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+            frame = con.execute(f"SELECT * FROM read_parquet('{sql_path(temporary)}')").fetch_df()
+            temporary.unlink(missing_ok=True)
+            commit_frames(target, checkpoint, {"data.parquet": frame}, metadata={"trade_date": trade_date, "sources": records})
+            state["status"] = "complete"
+            state["detail"] = f"{len(frame)} rows"
+        return states
+    finally:
+        con.close()
+
+
+def _date_chunks(dates: list[str], workers: int) -> list[list[str]]:
+    count = max(1, min(int(workers), len(dates)))
+    return [dates[index::count] for index in range(count)]
+
+
 def build_intraday_labels_v2(
     *,
     gff_campaign_root: str | Path,
@@ -53,6 +133,7 @@ def build_intraday_labels_v2(
     threads: int = 24,
     memory_limit_gb: float = 60,
     temp_directory: str | Path | None = None,
+    workers: int = 1,
 ) -> Path:
     campaign = load_gff_campaign_contract(gff_campaign_root)
     dates = selected_dates(campaign["dates"], start_date, end_date)
@@ -99,62 +180,89 @@ def build_intraday_labels_v2(
         con.execute(f"SET temp_directory='{sql_path(Path(temp_directory))}'")
     dates_sql = ",".join(sql_literal(value) for value in dates)
     signal_pattern = sql_path(global_signals / "**" / "data.parquet")
-    con.execute(f"""
-      CREATE VIEW decisions AS
-      SELECT DISTINCT CAST(trade_date AS VARCHAR) trade_date,
-             CAST(decision_time AS TIMESTAMPTZ) decision_time, CAST(symbol_id AS BIGINT) symbol_id
-      FROM read_parquet('{signal_pattern}', union_by_name=true, hive_partitioning=false)
-      WHERE CAST(trade_date AS VARCHAR) IN ({dates_sql})
-    """)
-    con.execute(f"""
-      CREATE VIEW bars AS
-      SELECT CAST(trade_date AS VARCHAR) trade_date, CAST(symbol_id AS BIGINT) symbol_id,
-             CAST(timestamp AS TIMESTAMPTZ) timestamp, CAST(available_time AS TIMESTAMPTZ) available_time,
-             CAST(open AS DOUBLE) open, CAST(close AS DOUBLE) close
-      FROM read_parquet('{sql_path(bars / 'date=*' / '*.parquet')}', union_by_name=true, hive_partitioning=false)
-      WHERE CAST(trade_date AS VARCHAR) IN ({dates_sql})
-        AND symbol_id IS NOT NULL AND open IS NOT NULL AND close IS NOT NULL
-        AND CAST(timezone('America/New_York', timestamp) AS TIME) BETWEEN TIME '09:30:00' AND TIME '15:59:00'
-    """)
+    bars_pattern = sql_path(bars / "date=*" / "*.parquet")
 
     states: list[dict[str, object]] = []
     completed = reused = 0
     write_progress(diagnostics, stage="intraday-label-v2", total=len(dates), completed=0, units=[])
     try:
-        for trade_date in dates:
-            records = [file_record(path) for path in files[trade_date]]
-            checkpoint = CheckpointSpec("intraday-label-v2", trade_date, contract_hash, sha256_json(records))
-            target = parts / f"date={trade_date}"
-            state = {"unit": trade_date, "status": "pending", "attempt": 0, "detail": str(target)}
-            states.append(state)
-            if checkpoint_valid(target, checkpoint, required_files=("data.parquet",)):
-                state["status"] = "reused"; completed += 1; reused += 1
+        if workers > 1 and len(dates) > 1:
+            payloads = [
+                {
+                    "dates": chunk,
+                    "files": {value: [str(path) for path in files[value]] for value in chunk},
+                    "specs": [{"name": spec.name, "minutes": spec.horizon_minutes, "label_id": spec.label_id} for spec in specs],
+                    "parts": str(parts),
+                    "contract_hash": contract_hash,
+                    "signal_pattern": signal_pattern,
+                    "bars_pattern": bars_pattern,
+                    "threads": max(1, threads // workers),
+                    "memory_limit_gb": memory_limit_gb / workers,
+                    "temp_directory": str(temp_directory) if temp_directory else None,
+                }
+                for chunk in _date_chunks(dates, workers)
+            ]
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                for chunk_states in pool.map(_intraday_chunk_worker, payloads):
+                    for state in chunk_states:
+                        states.append(state)
+                        completed += 1
+                        if state["status"] == "reused":
+                            reused += 1
+                        write_progress(diagnostics, stage="intraday-label-v2", total=len(dates), completed=completed, reused=reused, current=state["unit"], units=sorted(states, key=lambda row: str(row["unit"])))
+        else:
+            con.execute(f"""
+              CREATE VIEW decisions AS
+              SELECT DISTINCT CAST(trade_date AS VARCHAR) trade_date,
+                     CAST(decision_time AS TIMESTAMPTZ) decision_time, CAST(symbol_id AS BIGINT) symbol_id
+              FROM read_parquet('{signal_pattern}', union_by_name=true, hive_partitioning=false)
+              WHERE CAST(trade_date AS VARCHAR) IN ({dates_sql})
+            """)
+            con.execute(f"""
+              CREATE VIEW bars AS
+              SELECT CAST(trade_date AS VARCHAR) trade_date, CAST(symbol_id AS BIGINT) symbol_id,
+                     CAST(timestamp AS TIMESTAMPTZ) "timestamp", CAST(available_time AS TIMESTAMPTZ) available_time,
+                     CAST(open AS DOUBLE) "open", CAST(close AS DOUBLE) "close"
+              FROM read_parquet('{bars_pattern}', union_by_name=true, hive_partitioning=false)
+              WHERE CAST(trade_date AS VARCHAR) IN ({dates_sql})
+                AND symbol_id IS NOT NULL AND open IS NOT NULL AND close IS NOT NULL
+                AND CAST(timezone('America/New_York', timestamp) AS TIME) BETWEEN TIME '09:30:00' AND TIME '15:59:00'
+            """)
+
+            for trade_date in dates:
+                records = [file_record(path) for path in files[trade_date]]
+                checkpoint = CheckpointSpec("intraday-label-v2", trade_date, contract_hash, sha256_json(records))
+                target = parts / f"date={trade_date}"
+                state = {"unit": trade_date, "status": "pending", "attempt": 0, "detail": str(target)}
+                states.append(state)
+                if checkpoint_valid(target, checkpoint, required_files=("data.parquet",)):
+                    state["status"] = "reused"; completed += 1; reused += 1
+                    write_progress(diagnostics, stage="intraday-label-v2", total=len(dates), completed=completed, reused=reused, current=trade_date, units=states)
+                    continue
+                queries: list[str] = []
+                for spec in specs:
+                    queries.append(f"""
+                      SELECT d.trade_date,d.decision_time,d.symbol_id,{sql_literal(spec.label_id)} label_id,
+                             entry.timestamp entry_time,exit.timestamp + INTERVAL '1 minute' exit_time,
+                             greatest(entry.available_time,exit.available_time,exit.timestamp + INTERVAL '1 minute') label_available_time,
+                             exit.close/nullif(entry.open,0)-1 target_return
+                      FROM decisions d
+                      JOIN bars entry ON entry.trade_date=d.trade_date AND entry.symbol_id=d.symbol_id
+                                     AND entry.timestamp=d.decision_time + INTERVAL '1 minute'
+                      JOIN bars exit ON exit.trade_date=d.trade_date AND exit.symbol_id=d.symbol_id
+                                    AND exit.timestamp=d.decision_time + INTERVAL '{spec.horizon_minutes} minute'
+                      WHERE d.trade_date={sql_literal(trade_date)}
+                        AND entry.timestamp>d.decision_time
+                        AND exit.timestamp + INTERVAL '1 minute'>entry.timestamp
+                    """)
+                temporary = target.parent / f".{target.name}.part.parquet"
+                temporary.unlink(missing_ok=True)
+                con.execute("COPY (" + " UNION ALL ".join(queries) + f") TO '{sql_path(temporary)}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+                frame = con.execute(f"SELECT * FROM read_parquet('{sql_path(temporary)}')").fetch_df()
+                temporary.unlink(missing_ok=True)
+                commit_frames(target, checkpoint, {"data.parquet": frame}, metadata={"trade_date": trade_date, "sources": records})
+                state["status"] = "complete"; state["detail"] = f"{len(frame)} rows"; completed += 1
                 write_progress(diagnostics, stage="intraday-label-v2", total=len(dates), completed=completed, reused=reused, current=trade_date, units=states)
-                continue
-            queries: list[str] = []
-            for spec in specs:
-                queries.append(f"""
-                  SELECT d.trade_date,d.decision_time,d.symbol_id,{sql_literal(spec.label_id)} label_id,
-                         entry.timestamp entry_time,exit.timestamp + INTERVAL '1 minute' exit_time,
-                         greatest(entry.available_time,exit.available_time,exit.timestamp + INTERVAL '1 minute') label_available_time,
-                         exit.close/nullif(entry.open,0)-1 target_return
-                  FROM decisions d
-                  JOIN bars entry ON entry.trade_date=d.trade_date AND entry.symbol_id=d.symbol_id
-                                 AND entry.timestamp=d.decision_time + INTERVAL '1 minute'
-                  JOIN bars exit ON exit.trade_date=d.trade_date AND exit.symbol_id=d.symbol_id
-                                AND exit.timestamp=d.decision_time + INTERVAL '{spec.horizon_minutes} minute'
-                  WHERE d.trade_date={sql_literal(trade_date)}
-                    AND entry.timestamp>d.decision_time
-                    AND exit.timestamp + INTERVAL '1 minute'>entry.timestamp
-                """)
-            temporary = target.parent / f".{target.name}.part.parquet"
-            temporary.unlink(missing_ok=True)
-            con.execute("COPY (" + " UNION ALL ".join(queries) + f") TO '{sql_path(temporary)}' (FORMAT PARQUET, COMPRESSION ZSTD)")
-            frame = con.execute(f"SELECT * FROM read_parquet('{sql_path(temporary)}')").fetch_df()
-            temporary.unlink(missing_ok=True)
-            commit_frames(target, checkpoint, {"data.parquet": frame}, metadata={"trade_date": trade_date, "sources": records})
-            state["status"] = "complete"; state["detail"] = f"{len(frame)} rows"; completed += 1
-            write_progress(diagnostics, stage="intraday-label-v2", total=len(dates), completed=completed, reused=reused, current=trade_date, units=states)
 
         parts_pattern = sql_path(parts / "date=*" / "data.parquet")
         coverage: list[dict[str, object]] = []

@@ -56,6 +56,8 @@ def main() -> None:
     parser.add_argument("--expected-git-commit")
     parser.add_argument("--require-clean", action="store_true")
     parser.add_argument("--force-export", action="store_true")
+    parser.add_argument("--export-workers", type=int, default=1)
+    parser.add_argument("--label-workers", type=int, default=1)
     args = parser.parse_args()
 
     if args.factor_workers < 1:
@@ -89,6 +91,7 @@ def main() -> None:
         require_clean=args.require_clean,
         require_campaign_success=True,
         force=args.force_export,
+        workers=args.export_workers,
     )
     intraday_manifest = build_intraday_labels_v2(
         gff_campaign_root=args.gff_campaign_root,
@@ -100,6 +103,7 @@ def main() -> None:
         threads=args.threads,
         memory_limit_gb=max(8.0, args.memory_limit_gb / 2),
         temp_directory=temp / "intraday_labels",
+        workers=args.label_workers,
     )
     daily_manifest = build_daily_labels_v2(
         gff_campaign_root=args.gff_campaign_root,
@@ -112,6 +116,7 @@ def main() -> None:
         threads=args.threads,
         memory_limit_gb=max(8.0, args.memory_limit_gb / 2),
         temp_directory=temp / "daily_labels",
+        workers=args.label_workers,
     )
     combined_manifest, combined_label_manifest = merge_horizon_manifests(
         (intraday_manifest, daily_manifest),

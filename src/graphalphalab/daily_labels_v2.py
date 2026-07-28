@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
+
 from dataclasses import dataclass
 from pathlib import Path
 import os
@@ -99,6 +101,104 @@ def _contract(spec: DailyLabelSpec) -> LabelContract:
     )
 
 
+def _daily_chunk_worker(payload: dict) -> list[dict[str, object]]:
+    # Each worker gets its own DuckDB connection with a split budget and a
+    # support window of chunk base dates plus the trailing lookahead sessions
+    # needed for N+offset exits. Calendar session indices are relative, so a
+    # worker-local calendar preserves offset arithmetic.
+    chunk = [str(value) for value in payload["dates"]]
+    support = [str(value) for value in payload["support"]]
+    specs = payload["specs"]
+    parts = Path(payload["parts"])
+    files = {str(key): [Path(value) for value in values] for key, values in payload["files"].items()}
+    contract_hash = str(payload["contract_hash"])
+    con = duckdb.connect()
+    try:
+        con.execute(f"PRAGMA threads={max(1, int(payload['threads']))}")
+        con.execute(f"SET memory_limit='{float(payload['memory_limit_gb']):g}GB'")
+        if payload.get("temp_directory"):
+            temporary_dir = Path(payload["temp_directory"]) / f"daily-worker-{os.getpid()}"
+            temporary_dir.mkdir(parents=True, exist_ok=True)
+            con.execute(f"SET temp_directory='{sql_path(temporary_dir)}'")
+        support_sql = ",".join(sql_literal(value) for value in support)
+        dates_sql = ",".join(sql_literal(value) for value in chunk)
+        con.execute(f"""
+          CREATE VIEW bars AS
+          SELECT CAST(trade_date AS VARCHAR) trade_date, CAST(symbol_id AS BIGINT) symbol_id,
+                 CAST(timestamp AS TIMESTAMPTZ) "timestamp", CAST(available_time AS TIMESTAMPTZ) available_time,
+                 CAST(open AS DOUBLE) "open", CAST(close AS DOUBLE) "close"
+          FROM read_parquet('{payload["bars_pattern"]}', union_by_name=true, hive_partitioning=false)
+          WHERE CAST(trade_date AS VARCHAR) IN ({support_sql})
+            AND symbol_id IS NOT NULL AND open IS NOT NULL AND close IS NOT NULL
+        """)
+        con.execute("""
+          CREATE VIEW rth AS SELECT * FROM bars
+          WHERE CAST(timezone('America/New_York', timestamp) AS TIME) BETWEEN TIME '09:30:00' AND TIME '16:00:00'
+        """)
+        con.execute("""
+          CREATE VIEW ohlc AS
+          SELECT trade_date, symbol_id,
+                 min(timestamp) rth_open_time, max(timestamp) rth_close_time,
+                 arg_min(open,timestamp) rth_open_price, arg_max(close,timestamp) rth_close_price,
+                 arg_min(available_time,timestamp) rth_open_available_time,
+                 arg_max(available_time,timestamp) rth_close_available_time
+          FROM rth GROUP BY trade_date,symbol_id
+        """)
+        con.execute("CREATE VIEW calendar AS SELECT trade_date,row_number() OVER(ORDER BY trade_date)-1 session_index FROM (SELECT DISTINCT trade_date FROM ohlc)")
+        con.execute(f"""
+          CREATE VIEW decisions AS
+          SELECT DISTINCT CAST(trade_date AS VARCHAR) trade_date,
+                 CAST(decision_time AS TIMESTAMPTZ) decision_time, CAST(symbol_id AS BIGINT) symbol_id
+          FROM read_parquet('{payload["signal_pattern"]}', union_by_name=true, hive_partitioning=false)
+          WHERE CAST(trade_date AS VARCHAR) IN ({dates_sql})
+        """)
+        states: list[dict[str, object]] = []
+        for base_date in chunk:
+            base_index = support.index(base_date)
+            support_dates = support[base_index : base_index + int(payload["max_offset"]) + 1]
+            records = [file_record(path) for day in support_dates for path in files[day]]
+            checkpoint = CheckpointSpec("daily-label-v2", base_date, contract_hash, sha256_json(records))
+            target = parts / f"date={base_date}"
+            state = {"unit": base_date, "status": "pending", "attempt": 0, "detail": str(target)}
+            states.append(state)
+            if checkpoint_valid(target, checkpoint, required_files=("data.parquet",)):
+                state["status"] = "reused"
+                continue
+            queries: list[str] = []
+            for label in specs:
+                et, ep, ea = _point("entry", label["entry_point"])
+                xt, xp, xa = _point("exit", label["exit_point"])
+                queries.append(f"""
+                  SELECT d.trade_date,d.decision_time,d.symbol_id,{sql_literal(label['label_id'])} label_id,
+                         {et} entry_time,{xt} exit_time,greatest({ea},{xa}) label_available_time,
+                         {xp}/nullif({ep},0)-1 target_return,
+                         {int(label['entry_offset'])} entry_session_offset,{int(label['exit_offset'])} exit_session_offset,
+                         {sql_literal(label['entry_point'])} entry_point,{sql_literal(label['exit_point'])} exit_point
+                  FROM decisions d JOIN calendar b ON b.trade_date=d.trade_date
+                  JOIN calendar ec ON ec.session_index=b.session_index+{int(label['entry_offset'])}
+                  JOIN calendar xc ON xc.session_index=b.session_index+{int(label['exit_offset'])}
+                  JOIN ohlc entry ON entry.trade_date=ec.trade_date AND entry.symbol_id=d.symbol_id
+                  JOIN ohlc exit ON exit.trade_date=xc.trade_date AND exit.symbol_id=d.symbol_id
+                  WHERE d.trade_date={sql_literal(base_date)} AND {et}>d.decision_time AND {xt}>{et}
+                """)
+            temporary = target.parent / f".{target.name}.{os.getpid()}.part.parquet"
+            temporary.unlink(missing_ok=True)
+            con.execute("COPY (" + " UNION ALL ".join(queries) + f") TO '{sql_path(temporary)}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+            frame = con.execute(f"SELECT * FROM read_parquet('{sql_path(temporary)}')").fetch_df()
+            temporary.unlink(missing_ok=True)
+            commit_frames(target, checkpoint, {"data.parquet": frame}, metadata={"base_date": base_date, "sources": records})
+            state["status"] = "complete"
+            state["detail"] = f"{len(frame)} rows"
+        return states
+    finally:
+        con.close()
+
+
+def _daily_date_chunks(dates: list[str], workers: int) -> list[list[str]]:
+    count = max(1, min(int(workers), len(dates)))
+    return [dates[index::count] for index in range(count)]
+
+
 def build_daily_labels_v2(
     *,
     gff_campaign_root: str | Path,
@@ -111,6 +211,7 @@ def build_daily_labels_v2(
     threads: int = 24,
     memory_limit_gb: float = 60,
     temp_directory: str | Path | None = None,
+    workers: int = 1,
 ) -> Path:
     campaign = load_gff_campaign_contract(gff_campaign_root)
     dates = selected_dates(campaign["dates"], start_date, end_date)
@@ -161,79 +262,121 @@ def build_daily_labels_v2(
         con.execute(f"SET temp_directory='{sql_path(Path(temp_directory))}'")
     support_sql = ",".join(sql_literal(value) for value in support)
     dates_sql = ",".join(sql_literal(value) for value in dates)
-    con.execute(f"""
-      CREATE VIEW bars AS
-      SELECT CAST(trade_date AS VARCHAR) trade_date, CAST(symbol_id AS BIGINT) symbol_id,
-             CAST(timestamp AS TIMESTAMPTZ) timestamp, CAST(available_time AS TIMESTAMPTZ) available_time,
-             CAST(open AS DOUBLE) open, CAST(close AS DOUBLE) close
-      FROM read_parquet('{sql_path(bars / 'date=*' / '*.parquet')}', union_by_name=true, hive_partitioning=false)
-      WHERE CAST(trade_date AS VARCHAR) IN ({support_sql})
-        AND symbol_id IS NOT NULL AND open IS NOT NULL AND close IS NOT NULL
-    """)
-    con.execute("""
-      CREATE VIEW rth AS SELECT * FROM bars
-      WHERE CAST(timezone('America/New_York', timestamp) AS TIME) BETWEEN TIME '09:30:00' AND TIME '16:00:00'
-    """)
-    con.execute("""
-      CREATE VIEW ohlc AS
-      SELECT trade_date, symbol_id,
-             min(timestamp) rth_open_time, max(timestamp) rth_close_time,
-             arg_min(open,timestamp) rth_open_price, arg_max(close,timestamp) rth_close_price,
-             arg_min(available_time,timestamp) rth_open_available_time,
-             arg_max(available_time,timestamp) rth_close_available_time
-      FROM rth GROUP BY trade_date,symbol_id
-    """)
-    con.execute("CREATE VIEW calendar AS SELECT trade_date,row_number() OVER(ORDER BY trade_date)-1 session_index FROM (SELECT DISTINCT trade_date FROM ohlc)")
     signal_pattern = sql_path(global_signals / "**" / "data.parquet")
-    con.execute(f"""
-      CREATE VIEW decisions AS
-      SELECT DISTINCT CAST(trade_date AS VARCHAR) trade_date,
-             CAST(decision_time AS TIMESTAMPTZ) decision_time, CAST(symbol_id AS BIGINT) symbol_id
-      FROM read_parquet('{signal_pattern}', union_by_name=true, hive_partitioning=false)
-      WHERE CAST(trade_date AS VARCHAR) IN ({dates_sql})
-    """)
+    bars_pattern = sql_path(bars / "date=*" / "*.parquet")
 
     states: list[dict[str, object]] = []
     completed = reused = 0
     write_progress(diagnostics, stage="daily-label-v2", total=len(dates), completed=0, units=[])
     try:
-        for base_date in dates:
-            base_index = support.index(base_date)
-            support_dates = support[base_index : base_index + max_offset + 1]
-            records = [file_record(path) for day in support_dates for path in files[day]]
-            checkpoint = CheckpointSpec("daily-label-v2", base_date, contract_hash, sha256_json(records))
-            target = parts / f"date={base_date}"
-            state = {"unit": base_date, "status": "pending", "attempt": 0, "detail": str(target)}
-            states.append(state)
-            if checkpoint_valid(target, checkpoint, required_files=("data.parquet",)):
-                state["status"] = "reused"; completed += 1; reused += 1
+        if workers > 1 and len(dates) > 1:
+            spec_payloads = [
+                {
+                    "label_id": spec.label_id,
+                    "entry_offset": spec.entry_offset,
+                    "entry_point": spec.entry_point,
+                    "exit_offset": spec.exit_offset,
+                    "exit_point": spec.exit_point,
+                }
+                for spec in specs
+            ]
+            payloads = []
+            for chunk in _daily_date_chunks(dates, workers):
+                first_index = support.index(chunk[0])
+                last_index = min(len(support), support.index(chunk[-1]) + max_offset + 1)
+                payloads.append(
+                    {
+                        "dates": chunk,
+                        "support": support[first_index:last_index],
+                        "max_offset": max_offset,
+                        "files": {value: [str(path) for path in files[value]] for value in support[first_index:last_index] if value in files},
+                        "specs": spec_payloads,
+                        "parts": str(parts),
+                        "contract_hash": contract_hash,
+                        "signal_pattern": signal_pattern,
+                        "bars_pattern": bars_pattern,
+                        "threads": max(1, threads // workers),
+                        "memory_limit_gb": memory_limit_gb / workers,
+                        "temp_directory": str(temp_directory) if temp_directory else None,
+                    }
+                )
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                for chunk_states in pool.map(_daily_chunk_worker, payloads):
+                    for state in chunk_states:
+                        states.append(state)
+                        completed += 1
+                        if state["status"] == "reused":
+                            reused += 1
+                        write_progress(diagnostics, stage="daily-label-v2", total=len(dates), completed=completed, reused=reused, current=state["unit"], units=sorted(states, key=lambda row: str(row["unit"])))
+        else:
+            con.execute(f"""
+              CREATE VIEW bars AS
+              SELECT CAST(trade_date AS VARCHAR) trade_date, CAST(symbol_id AS BIGINT) symbol_id,
+                     CAST(timestamp AS TIMESTAMPTZ) "timestamp", CAST(available_time AS TIMESTAMPTZ) available_time,
+                     CAST(open AS DOUBLE) "open", CAST(close AS DOUBLE) "close"
+              FROM read_parquet('{bars_pattern}', union_by_name=true, hive_partitioning=false)
+              WHERE CAST(trade_date AS VARCHAR) IN ({support_sql})
+                AND symbol_id IS NOT NULL AND open IS NOT NULL AND close IS NOT NULL
+            """)
+            con.execute("""
+              CREATE VIEW rth AS SELECT * FROM bars
+              WHERE CAST(timezone('America/New_York', timestamp) AS TIME) BETWEEN TIME '09:30:00' AND TIME '16:00:00'
+            """)
+            con.execute("""
+              CREATE VIEW ohlc AS
+              SELECT trade_date, symbol_id,
+                     min(timestamp) rth_open_time, max(timestamp) rth_close_time,
+                     arg_min(open,timestamp) rth_open_price, arg_max(close,timestamp) rth_close_price,
+                     arg_min(available_time,timestamp) rth_open_available_time,
+                     arg_max(available_time,timestamp) rth_close_available_time
+              FROM rth GROUP BY trade_date,symbol_id
+            """)
+            con.execute("CREATE VIEW calendar AS SELECT trade_date,row_number() OVER(ORDER BY trade_date)-1 session_index FROM (SELECT DISTINCT trade_date FROM ohlc)")
+            con.execute(f"""
+              CREATE VIEW decisions AS
+              SELECT DISTINCT CAST(trade_date AS VARCHAR) trade_date,
+                     CAST(decision_time AS TIMESTAMPTZ) decision_time, CAST(symbol_id AS BIGINT) symbol_id
+              FROM read_parquet('{signal_pattern}', union_by_name=true, hive_partitioning=false)
+              WHERE CAST(trade_date AS VARCHAR) IN ({dates_sql})
+            """)
+
+            for base_date in dates:
+                base_index = support.index(base_date)
+                support_dates = support[base_index : base_index + max_offset + 1]
+                records = [file_record(path) for day in support_dates for path in files[day]]
+                checkpoint = CheckpointSpec("daily-label-v2", base_date, contract_hash, sha256_json(records))
+                target = parts / f"date={base_date}"
+                state = {"unit": base_date, "status": "pending", "attempt": 0, "detail": str(target)}
+                states.append(state)
+                if checkpoint_valid(target, checkpoint, required_files=("data.parquet",)):
+                    state["status"] = "reused"; completed += 1; reused += 1
+                    write_progress(diagnostics, stage="daily-label-v2", total=len(dates), completed=completed, reused=reused, current=base_date, units=states)
+                    continue
+                queries: list[str] = []
+                for label in specs:
+                    et, ep, ea = _point("entry", label.entry_point)
+                    xt, xp, xa = _point("exit", label.exit_point)
+                    queries.append(f"""
+                      SELECT d.trade_date,d.decision_time,d.symbol_id,{sql_literal(label.label_id)} label_id,
+                             {et} entry_time,{xt} exit_time,greatest({ea},{xa}) label_available_time,
+                             {xp}/nullif({ep},0)-1 target_return,
+                             {label.entry_offset} entry_session_offset,{label.exit_offset} exit_session_offset,
+                             {sql_literal(label.entry_point)} entry_point,{sql_literal(label.exit_point)} exit_point
+                      FROM decisions d JOIN calendar b ON b.trade_date=d.trade_date
+                      JOIN calendar ec ON ec.session_index=b.session_index+{label.entry_offset}
+                      JOIN calendar xc ON xc.session_index=b.session_index+{label.exit_offset}
+                      JOIN ohlc entry ON entry.trade_date=ec.trade_date AND entry.symbol_id=d.symbol_id
+                      JOIN ohlc exit ON exit.trade_date=xc.trade_date AND exit.symbol_id=d.symbol_id
+                      WHERE d.trade_date={sql_literal(base_date)} AND {et}>d.decision_time AND {xt}>{et}
+                    """)
+                temporary = target.parent / f".{target.name}.part.parquet"
+                temporary.unlink(missing_ok=True)
+                con.execute("COPY (" + " UNION ALL ".join(queries) + f") TO '{sql_path(temporary)}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+                frame = con.execute(f"SELECT * FROM read_parquet('{sql_path(temporary)}')").fetch_df()
+                temporary.unlink(missing_ok=True)
+                commit_frames(target, checkpoint, {"data.parquet": frame}, metadata={"base_date": base_date, "sources": records})
+                state["status"] = "complete"; state["detail"] = f"{len(frame)} rows"; completed += 1
                 write_progress(diagnostics, stage="daily-label-v2", total=len(dates), completed=completed, reused=reused, current=base_date, units=states)
-                continue
-            queries: list[str] = []
-            for label in specs:
-                et, ep, ea = _point("entry", label.entry_point)
-                xt, xp, xa = _point("exit", label.exit_point)
-                queries.append(f"""
-                  SELECT d.trade_date,d.decision_time,d.symbol_id,{sql_literal(label.label_id)} label_id,
-                         {et} entry_time,{xt} exit_time,greatest({ea},{xa}) label_available_time,
-                         {xp}/nullif({ep},0)-1 target_return,
-                         {label.entry_offset} entry_session_offset,{label.exit_offset} exit_session_offset,
-                         {sql_literal(label.entry_point)} entry_point,{sql_literal(label.exit_point)} exit_point
-                  FROM decisions d JOIN calendar b ON b.trade_date=d.trade_date
-                  JOIN calendar ec ON ec.session_index=b.session_index+{label.entry_offset}
-                  JOIN calendar xc ON xc.session_index=b.session_index+{label.exit_offset}
-                  JOIN ohlc entry ON entry.trade_date=ec.trade_date AND entry.symbol_id=d.symbol_id
-                  JOIN ohlc exit ON exit.trade_date=xc.trade_date AND exit.symbol_id=d.symbol_id
-                  WHERE d.trade_date={sql_literal(base_date)} AND {et}>d.decision_time AND {xt}>{et}
-                """)
-            temporary = target.parent / f".{target.name}.part.parquet"
-            temporary.unlink(missing_ok=True)
-            con.execute("COPY (" + " UNION ALL ".join(queries) + f") TO '{sql_path(temporary)}' (FORMAT PARQUET, COMPRESSION ZSTD)")
-            frame = con.execute(f"SELECT * FROM read_parquet('{sql_path(temporary)}')").fetch_df()
-            temporary.unlink(missing_ok=True)
-            commit_frames(target, checkpoint, {"data.parquet": frame}, metadata={"base_date": base_date, "sources": records})
-            state["status"] = "complete"; state["detail"] = f"{len(frame)} rows"; completed += 1
-            write_progress(diagnostics, stage="daily-label-v2", total=len(dates), completed=completed, reused=reused, current=base_date, units=states)
 
         parts_pattern = sql_path(parts / "date=*" / "data.parquet")
         coverage: list[dict[str, object]] = []
