@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from functools import lru_cache
 import json
@@ -315,6 +316,9 @@ def _run_factor_task(task: FactorTask) -> dict[str, object]:
                 factor[column] = pd.Series([None] * len(factor), dtype=object)
             else:
                 factor[column] = pd.Categorical([value] * len(factor))
+        if "trade_date" in factor.columns:
+            # Repeated date strings dominate frame width on long campaigns.
+            factor["trade_date"] = factor["trade_date"].astype("category")
         input_rows = int(len(factor))
         symbol_count = (
             int(factor[task.symbol_column].nunique())
@@ -556,6 +560,25 @@ def _audit_scope_horizon(
         ).as_dict()
     finally:
         connection.close()
+
+
+def _preflight_cache_file(checkpoint_root: Path, name: str) -> Path:
+    return checkpoint_root / "preflight" / name
+
+
+def _preflight_cache_read(path: Path, key: str):
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("key") != key:
+        return None
+    return payload.get("value")
+
+
+def _preflight_cache_write(path: Path, key: str, value) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, {"key": key, "value": value})
 
 
 def _write_global_progress(
@@ -808,6 +831,74 @@ def _build_run_manifest(
     )
 
 
+def _healable_pool_run(
+    ordered_pending: deque,
+    *,
+    initial_workers: int,
+    min_workers: int,
+    run_task,
+    on_success,
+    on_task_failure,
+    on_pool_rebuild,
+    executor_factory=ProcessPoolExecutor,
+) -> None:
+    # A worker killed by the OS (e.g. OOM) breaks the whole ProcessPoolExecutor.
+    # Instead of aborting the campaign, shrink the pool by one step and
+    # continue; in-flight tasks are requeued because their checkpoints were
+    # never committed. Genuine task exceptions never trigger a rebuild.
+    current_workers = max(1, int(initial_workers))
+    min_workers = max(1, min(int(min_workers), current_workers))
+    rebuilds = 0
+    active: dict[object, object] = {}
+    while True:
+        pool_broken = False
+        with executor_factory(max_workers=current_workers) as executor:
+            inflight_limit = max(current_workers, current_workers * 2)
+            while ordered_pending and len(active) < inflight_limit:
+                task = ordered_pending.popleft()
+                active[executor.submit(run_task, task)] = task
+            while active:
+                done, _ = wait(active, return_when=FIRST_COMPLETED)
+                for future in done:
+                    task = active.pop(future)
+                    try:
+                        result = future.result()
+                    except BrokenProcessPool:
+                        # The popped task never committed its checkpoint; it
+                        # must be requeued together with the remaining active
+                        # tasks before the pool is rebuilt smaller.
+                        ordered_pending.appendleft(task)
+                        pool_broken = True
+                        break
+                    except Exception as exc:
+                        on_task_failure(task, exc)
+                        if ordered_pending:
+                            replacement = ordered_pending.popleft()
+                            active[executor.submit(run_task, replacement)] = replacement
+                        continue
+                    on_success(task, result)
+                    if ordered_pending:
+                        next_task = ordered_pending.popleft()
+                        active[executor.submit(run_task, next_task)] = next_task
+                if pool_broken:
+                    break
+        if not pool_broken:
+            return
+        requeued = [task for task in active.values() if task is not None]
+        active = {}
+        for task in reversed(requeued):
+            ordered_pending.appendleft(task)
+        rebuilds += 1
+        new_workers = max(min_workers, current_workers - max(2, current_workers // 4))
+        if new_workers >= current_workers:
+            raise RuntimeError(
+                f"process pool broke at minimum workers={current_workers}; cannot heal further"
+            )
+        # +1: the task whose future surfaced BrokenProcessPool was requeued too
+        on_pool_rebuild(current_workers, new_workers, rebuilds, len(requeued) + 1)
+        current_workers = new_workers
+
+
 def run_dual_theme_alpha_campaign(
     signals_root: str | Path,
     horizon_manifest: str | Path,
@@ -897,6 +988,9 @@ def run_dual_theme_alpha_campaign(
         max(1, worker_budget.threads),
         resource_budget.temp_directory,
     )
+    checkpoint_root = output / "_checkpoints" / "dual_theme_alpha"
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+    preflight_signal_anchor = stable_export_manifest_record(export_manifest_path)
 
     scope_inventory: dict[
         str, tuple[Path, list[str], list[dict[str, object]], set[str]]
@@ -905,9 +999,34 @@ def run_dual_theme_alpha_campaign(
         scope_root = _scope_path(signals, batch_id, scope)
         if not scope_root.exists():
             continue
-        factor_keys, identities, signal_columns = _discover_scope_inventory(
-            scope_root, preflight_budget
+        inventory_key = sha256_json(
+            {
+                "kind": "scope_inventory_v1",
+                "scope": scope,
+                "signals": preflight_signal_anchor,
+            }
         )
+        inventory_cache = _preflight_cache_file(
+            checkpoint_root, f"scope_inventory_{scope}.json"
+        )
+        cached = _preflight_cache_read(inventory_cache, inventory_key)
+        if cached is not None:
+            factor_keys = [str(value) for value in cached["factor_keys"]]
+            identities = [dict(value) for value in cached["identities"]]
+            signal_columns = {str(value) for value in cached["signal_columns"]}
+        else:
+            factor_keys, identities, signal_columns = _discover_scope_inventory(
+                scope_root, preflight_budget
+            )
+            _preflight_cache_write(
+                inventory_cache,
+                inventory_key,
+                {
+                    "factor_keys": factor_keys,
+                    "identities": identities,
+                    "signal_columns": sorted(signal_columns),
+                },
+            )
         scope_inventory[scope] = (
             scope_root,
             factor_keys,
@@ -922,8 +1041,6 @@ def run_dual_theme_alpha_campaign(
         )
 
     plans: dict[str, HorizonPlan] = {}
-    checkpoint_root = output / "_checkpoints" / "dual_theme_alpha"
-    checkpoint_root.mkdir(parents=True, exist_ok=True)
 
     for horizon_spec in horizon_specs:
         contract = LabelContract.from_json(horizon_spec.label_contract)
@@ -1028,14 +1145,29 @@ def run_dual_theme_alpha_campaign(
             identities,
             signal_columns,
         ) in scope_inventory.items():
-            pit_audit = _audit_scope_horizon(
-                scope_root,
-                Path(horizon_spec.labels),
-                contract,
-                join_key_list,
-                allow_legacy_signals,
-                preflight_budget,
+            audit_key = sha256_json(
+                {
+                    "kind": "scope_horizon_pit_audit_v1",
+                    "scope": scope,
+                    "contract_hash": checkpoint_contract_hash,
+                    "join_keys": join_key_list,
+                    "allow_legacy_signals": bool(allow_legacy_signals),
+                }
             )
+            audit_cache = _preflight_cache_file(
+                checkpoint_root, f"pit_audit_{scope}_{plan.name}.json"
+            )
+            pit_audit = _preflight_cache_read(audit_cache, audit_key)
+            if pit_audit is None:
+                pit_audit = _audit_scope_horizon(
+                    scope_root,
+                    Path(horizon_spec.labels),
+                    contract,
+                    join_key_list,
+                    allow_legacy_signals,
+                    preflight_budget,
+                )
+                _preflight_cache_write(audit_cache, audit_key, pit_audit)
             for identity in identities:
                 ordinal += 1
                 task = FactorTask(
@@ -1106,7 +1238,6 @@ def run_dual_theme_alpha_campaign(
     total_tasks = sum(row["total"] for row in counts_by_horizon.values())
     completed = sum(row["completed"] for row in counts_by_horizon.values())
     ordered_pending = deque(round_robin_tasks(pending_tasks))
-    active: dict[object, FactorTask] = {}
     last_completed: str | None = None
     failed = 0
     failures: list[str] = []
@@ -1145,57 +1276,60 @@ def run_dual_theme_alpha_campaign(
     for horizon_name in plans:
         maybe_finalize(horizon_name)
 
+    pool_state = {"workers": int(workers)}
+
+    def _on_task_success(task: FactorTask, result: dict[str, object]) -> None:
+        nonlocal completed, reused, last_completed
+        last_completed = str(result["unit"])
+        completed += 1
+        horizon_counts = counts_by_horizon[task.horizon]
+        horizon_counts["completed"] += 1
+        if result.get("status") == "reused":
+            reused += 1
+            horizon_counts["reused"] += 1
+        maybe_finalize(task.horizon)
+        _write_running_progress()
+
+    def _on_task_failure(task: FactorTask, exc: Exception) -> None:
+        nonlocal failed
+        failed += 1
+        failures.append(f"{task.unit_name}: {exc!r}")
+        _write_running_progress()
+
+    def _on_pool_rebuild(old_workers: int, new_workers: int, rebuilds: int, requeued: int) -> None:
+        pool_state["workers"] = new_workers
+        failures.append(
+            f"pool_rebuild#{rebuilds}: BrokenProcessPool (likely OOM-killed worker); "
+            f"workers {old_workers}->{new_workers}; requeued={requeued}"
+        )
+        _write_running_progress()
+
+    def _write_running_progress() -> None:
+        _write_global_progress(
+            checkpoint_root,
+            status="running",
+            total=total_tasks,
+            completed=completed,
+            reused=reused,
+            failed=failed,
+            factor_workers=pool_state["workers"],
+            active=(),
+            counts_by_horizon=counts_by_horizon,
+            last_completed=last_completed,
+            error="; ".join(failures) if failures else None,
+        )
+
     try:
         if ordered_pending:
-            inflight_limit = max(workers, workers * 2)
-            with ProcessPoolExecutor(max_workers=workers) as executor:
-                while ordered_pending and len(active) < inflight_limit:
-                    task = ordered_pending.popleft()
-                    active[executor.submit(_run_factor_task, task)] = task
-                while active:
-                    done, _ = wait(active, return_when=FIRST_COMPLETED)
-                    for future in done:
-                        task = active.pop(future)
-                        try:
-                            result = future.result()
-                        except Exception as exc:
-                            # Record the failure and keep scheduling; horizon and
-                            # campaign reducers enforce factor completeness, so an
-                            # incomplete run can never publish _SUCCESS.
-                            failed += 1
-                            failures.append(f"{task.unit_name}: {exc!r}")
-                            if ordered_pending:
-                                replacement = ordered_pending.popleft()
-                                active[
-                                    executor.submit(_run_factor_task, replacement)
-                                ] = replacement
-                            continue
-                        last_completed = str(result["unit"])
-                        completed += 1
-                        horizon_counts = counts_by_horizon[task.horizon]
-                        horizon_counts["completed"] += 1
-                        if result.get("status") == "reused":
-                            reused += 1
-                            horizon_counts["reused"] += 1
-                        maybe_finalize(task.horizon)
-                        if ordered_pending:
-                            next_task = ordered_pending.popleft()
-                            active[
-                                executor.submit(_run_factor_task, next_task)
-                            ] = next_task
-                    _write_global_progress(
-                        checkpoint_root,
-                        status="running",
-                        total=total_tasks,
-                        completed=completed,
-                        reused=reused,
-                        failed=failed,
-                        factor_workers=workers,
-                        active=(task.unit_name for task in active.values()),
-                        counts_by_horizon=counts_by_horizon,
-                        last_completed=last_completed,
-                        error="; ".join(failures) if failures else None,
-                    )
+            _healable_pool_run(
+                ordered_pending,
+                initial_workers=workers,
+                min_workers=max(2, min(int(workers), 4)),
+                run_task=_run_factor_task,
+                on_success=_on_task_success,
+                on_task_failure=_on_task_failure,
+                on_pool_rebuild=_on_pool_rebuild,
+            )
         for horizon_name in plans:
             maybe_finalize(horizon_name)
         if failures:
