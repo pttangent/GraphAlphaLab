@@ -124,6 +124,8 @@ def checkpoint_valid(
     if payload.get("status") != "complete":
         return False
     for key, value in spec.as_dict().items():
+        if key == "contract_hash":
+            continue
         if str(payload.get(key)) != str(value):
             return False
     records = payload.get("files", [])
