@@ -12,6 +12,10 @@ from graphalphalab.forward_volatility_report_pack import install as install_repo
 
 install_report_pack()
 
+from graphalphalab.forward_volatility_report_streaming import install as install_report_streaming  # noqa: E402
+
+install_report_streaming()
+
 from graphalphalab.forward_volatility import (  # noqa: E402
     DEFAULT_HORIZONS,
     DEFAULT_TARGETS,
