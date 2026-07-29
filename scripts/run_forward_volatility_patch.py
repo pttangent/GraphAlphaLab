@@ -4,12 +4,16 @@ import argparse
 import json
 from pathlib import Path
 
-from graphalphalab.forward_volatility import (
+from graphalphalab.forward_volatility_hardening import install as install_hardening
+
+install_hardening()
+
+from graphalphalab.forward_volatility import (  # noqa: E402
     DEFAULT_HORIZONS,
     DEFAULT_TARGETS,
     run_forward_volatility_patch,
 )
-from graphalphalab.governance import ResourceBudget
+from graphalphalab.governance import ResourceBudget  # noqa: E402
 
 
 def _csv_ints(value: str) -> tuple[int, ...]:
